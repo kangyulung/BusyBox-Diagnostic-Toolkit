@@ -1,0 +1,5 @@
+menu "my_diag"
+
+INSERT
+
+endmenu
