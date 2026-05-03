@@ -35,7 +35,9 @@ int diag_read_proc(int pid, diag_proc_t *p) {
     if (buf) {
         char *s = strrchr(buf, ')'); // 找最後一個括號以精確定位
         if (s) {
-            sscanf(s + 2, "%*c %d", &p->ppid);
+            //sscanf(s + 2, "%*c %d", &p->ppid);
+            sscanf(s + 2, "%*c %d %*d %*d %*d %*d %*d %*d %*d %*d %*d %lu %lu", 
+                   &p->ppid, &p->utime, &p->stime);
             char *start = strchr(buf, '(');
             if (start) {
                 int len = s - start - 1;

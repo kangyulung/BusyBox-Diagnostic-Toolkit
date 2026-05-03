@@ -7,9 +7,13 @@
 typedef struct {
     int pid;
     int ppid;
+    unsigned int uid;
+    char state;
     char comm[32];
     unsigned long vmsize;
     unsigned long rss;
+    unsigned long utime;
+    unsigned long stime;
 } diag_proc_t;
 
 /* 檔案系統資訊結構 */
