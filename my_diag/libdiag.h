@@ -18,10 +18,11 @@ typedef struct {
 
 /* 檔案系統資訊結構 */
 typedef struct {
-    unsigned long total_inodes;
-    unsigned long free_inodes;
-    uint64_t total_bytes;
-    uint64_t free_bytes;
+    unsigned long total_inodes;  /* statfs.f_files */
+    unsigned long free_inodes;   /* statfs.f_ffree */
+    uint64_t total_bytes;        /* f_blocks * f_frsize */
+    uint64_t free_bytes;         /* f_bavail * f_frsize（非 root 可用） */
+    uint64_t free_bytes_priv;    /* f_bfree  * f_frsize（含 root 保留區） */
 } diag_fs_t;
 
 /* 網路連線結構 */
