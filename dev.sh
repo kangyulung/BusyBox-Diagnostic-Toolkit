@@ -9,4 +9,4 @@ echo "正在進入開發環境並同步代碼..."
 docker run -it --privileged \
     -v $(pwd):/home/project/busybox \
     busybox-dev-env \
-    bash -c "if [ ! -f .config ]; then make defconfig && sed -i 's/CONFIG_STATIC=n/CONFIG_STATIC=y/' .config; fi; make -j\$(nproc); bash"
+    bash -c "bash ./compile.sh; bash"

@@ -19,6 +19,8 @@ echo "Generating build files..."
 # 如果你想手動調整，改用 menuconfig
 echo "Configuring busybox..."
 make defconfig
+# 強制靜態連結（與 dev.sh 保持一致）
+sed -i 's/CONFIG_STATIC=n/CONFIG_STATIC=y/' .config
 # 非 x86/x86_64 環境（如 ARM64 colima）無法編譯 x86 SHA 硬體加速，自動停用
 case "$(uname -m)" in
     i386|i686|x86_64) ;;
