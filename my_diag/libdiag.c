@@ -65,10 +65,12 @@ int diag_read_fs(const char *path, diag_fs_t *f) {
     struct statfs s;
     if (statfs(path, &s) != 0) return -1;
 
-    f->total_inodes = s.f_files;
-    f->free_inodes = s.f_ffree;
-    f->total_bytes = (uint64_t)s.f_blocks * s.f_bsize;
-    f->free_bytes = (uint64_t)s.f_bavail * s.f_bsize;
+    f->total_inodes   = s.f_files;
+    f->free_inodes    = s.f_ffree;
+    /* f_frsize 是實際片段大小，df 用此欄位計算；f_bsize 是最佳傳輸大小，virtiofs 等 fs 兩者差距可達 256x */
+    f->total_bytes    = (uint64_t)s.f_blocks * s.f_frsize;
+    f->free_bytes     = (uint64_t)s.f_bavail * s.f_frsize;
+    f->free_bytes_priv = (uint64_t)s.f_bfree  * s.f_frsize;
     return 0;
 }
 
