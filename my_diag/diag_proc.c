@@ -1,9 +1,9 @@
 /* vi: set sw=4 ts=4: */
 //config:config MY_PROC
-//config:	bool "my_proc (Resource Analyzer)"
-//config:	default y
-//config:	help
-//config:	  Simple process resource analyzer with tree view support.
+//config: 	bool "my_proc (Resource Analyzer)"
+//config: 	default y
+//config: 	help
+//config: 	  Simple process resource analyzer with tree view support.
 
 //applet:IF_MY_PROC(APPLET(my_proc, BB_DIR_USR_BIN, BB_SUID_DROP))
 
@@ -12,257 +12,284 @@
 
 //usage:#define my_proc_trivial_usage "[-ts]"
 //usage:#define my_proc_full_usage "\n\n"
-//usage:       "Analyze process resources\n"
-//usage:     "\n	-t	Show process tree"
-//usage:     "\n	-s	Show real-time CPU usage (top mode)"
+//usage:	  "Analyze process resources\n"
+//usage:	"\n	   -t	Show process tree"
+//usage:	"\n	   -s	Show real-time CPU usage (top mode)"
 
 #include "libbb.h"
 #include "libdiag.h"
 #include <sys/sysinfo.h>
 #include <pwd.h>
+#include <termios.h>
+#include <ctype.h>
+#define SAFE_COMPARE(a, b) (((a) > (b)) - ((a) < (b)))
 
-// 建立一個節點結構來存儲所有行程，避免重複掃描 /proc
 typedef struct proc_node {
     diag_proc_t info;
     struct proc_node *next;
 } proc_node_t;
 
-// 獲取總記憶體（KB）
-static unsigned long get_total_mem(void) {
-    struct sysinfo info;
-    if (sysinfo(&info) == 0) return (info.totalram * info.mem_unit) / 1024;
-    return 0;
+typedef enum { VIEW_TOP, VIEW_TREE } view_mode_t;
+
+static char g_sort_mode = 'P'; 
+static view_mode_t g_view_mode = VIEW_TOP;
+
+static const char* get_sort_label(void) {
+    switch (g_sort_mode) {
+        case 'P': return "CPU%"; case 'M': return "RSS";
+        case 'V': return "VSZ";  case 'I': return "PID";
+        case 'O': return "PPID"; case 'U': return "USER";
+        case 'S': return "STAT"; case 'C': return "COMMAND";
+        default:  return "PID";
+    }
 }
 
-// 獲取 Uptime 字串
-static char* get_uptime_str(void) {
-    struct sysinfo info;
-    sysinfo(&info);
-    int h = info.uptime / 3600;
-    int m = (info.uptime % 3600) / 60;
-    return xasprintf("%dh %dm", h, m);
+static int sort_func(const void *a, const void *b) {
+    diag_proc_t *pa = &(*(proc_node_t**)a)->info;
+    diag_proc_t *pb = &(*(proc_node_t**)b)->info;
+    int res = 0;
+
+    switch (g_sort_mode) {
+        /* 注意：這裡要改成大寫的 SAFE_COMPARE */
+        case 'P': res = SAFE_COMPARE(pb->utime + pb->stime, pa->utime + pa->stime); break;
+        case 'M': res = SAFE_COMPARE(pb->rss, pa->rss); break;
+        case 'V': res = SAFE_COMPARE(pb->vmsize, pa->vmsize); break;
+        case 'I': res = SAFE_COMPARE(pa->pid, pb->pid); break;
+        case 'O': res = SAFE_COMPARE(pa->ppid, pb->ppid); break;
+        case 'U': res = SAFE_COMPARE(pa->uid, pb->uid); break;
+        case 'S': res = SAFE_COMPARE(pa->state, pb->state); break;
+        case 'C': res = strcmp(pa->comm ? pa->comm : "", pb->comm ? pb->comm : ""); break;
+    }
+    return res ? res : SAFE_COMPARE(pa->pid, pb->pid);
 }
 
-// 1. 職責拆分：只負責建立資料清單
-static proc_node_t* get_proc_list(void) {
-    DIR *dir = xopendir("/proc");
-    struct dirent *entry;
-    proc_node_t *head = NULL;
-
-    while ((entry = readdir(dir))) {
-        int pid = atoi(entry->d_name);
-        if (pid <= 0) continue;
-
-        proc_node_t *new_node = xzalloc(sizeof(proc_node_t));
-        if (diag_read_proc(pid, &new_node->info) == 0) {
-            new_node->next = head;
-            head = new_node;
-        } else {
-            free(new_node);
+static double calc_cpu(proc_node_t *curr, proc_node_t *prev_list, unsigned long long diff) {
+    if (!prev_list || diff <= 0) return 0.0;
+    for (proc_node_t *p = prev_list; p; p = p->next) {
+        if (p->info.pid == curr->info.pid) {
+            unsigned long ticks = (curr->info.utime + curr->info.stime) - (p->info.utime + p->info.stime);
+            return (double)ticks * 100.0 / diff;
         }
     }
-    closedir(dir);
-    return head;
+    return 0.0;
 }
 
-// 2. 職責拆分：印出原本的 top 列表
-static void print_list(proc_node_t *head) {
-    printf("%-8s %-8s %-15s %-10s %-10s\n", "PID", "PPID", "NAME", "VmSize", "RSS");
-    printf("------------------------------------------------------------\n");
+static void print_tree_rich(proc_node_t *head, proc_node_t *prev_list, unsigned long long diff, int ppid, int indent, unsigned long total_mem) {
     proc_node_t *curr = head;
     while (curr) {
-        printf("%-8d %-8d %-15s %-10lu %-10lu\n", 
-            curr->info.pid, curr->info.ppid, curr->info.comm, 
-            curr->info.vmsize, curr->info.rss);
+        if (curr->info.ppid == ppid) {
+            double cpu = calc_cpu(curr, prev_list, diff);
+            double mem = (total_mem > 0) ? (curr->info.rss * 100.0 / total_mem) : 0.0;
+            printf("%*s|- %-5d %-15s [%c] %8luK %5.1f%% %5.1f%%\033[K\n", 
+                   indent * 2, "", curr->info.pid, curr->info.comm, curr->info.state,
+                   curr->info.rss, cpu, mem);
+            print_tree_rich(head, prev_list, diff, curr->info.pid, indent + 1, total_mem);
+        }
         curr = curr->next;
     }
 }
 
-// 3. 職責拆分：專門負責記憶體釋放
+static proc_node_t* fetch_proc_list(void) {
+    proc_node_t *list = NULL;
+    DIR *dir = xopendir("/proc");
+    struct dirent *e;
+    while ((e = readdir(dir))) {
+        int pid = atoi(e->d_name);
+        if (pid <= 0) continue;
+        proc_node_t *n = xzalloc(sizeof(*n));
+        if (diag_read_proc(pid, &n->info) == 0) {
+            n->next = list;
+            list = n;
+        } else free(n);
+    }
+    closedir(dir);
+    return list;
+}
+
 static void free_proc_list(proc_node_t *head) {
     while (head) {
         proc_node_t *tmp = head;
         head = head->next;
+        // 注意：如果 diag_proc_t 內部有動態分配的字串（如 pa->comm），
+        // 記得也要在這裡 free(tmp->info.comm)，但目前 BusyBox 實作通常是固定陣列。
         free(tmp);
     }
 }
 
-// 修改後的樹狀列印：從記憶體 List 找子節點，而非從磁碟
-static void print_tree_fast(proc_node_t *head, int target_ppid, int indent) {
-    proc_node_t *curr = head;
-    while (curr) {
-        if (curr->info.ppid == target_ppid) {
-            printf("%*s|- %d: %s (RSS: %lu KB)\n", 
-                   indent * 2, "", curr->info.pid, curr->info.comm, curr->info.rss);
-            print_tree_fast(head, curr->info.pid, indent + 1);
-        }
-        curr = curr->next;
+static const char* get_time_str(unsigned long long start_ticks) {
+    static char buf[16];
+    static long hz = 0;
+    if (hz == 0) hz = sysconf(_SC_CLK_TCK);
+
+    struct sysinfo si;
+    sysinfo(&si);
+
+    // 計算自啟動以來的總秒數
+    unsigned long total_sec = si.uptime - (start_ticks / hz);
+    
+    if (total_sec < 3600) {
+        // 不滿一小時顯示 分:秒
+        snprintf(buf, sizeof(buf), "%02lu:%02lu", total_sec / 60, total_sec % 60);
+    } else {
+        // 超過一小時顯示 小時h分鐘m
+        snprintf(buf, sizeof(buf), "%2luh%02lu", total_sec / 3600, (total_sec / 60) % 60);
     }
-}
-
-// 輔助函數：取得系統總消耗時間 (jiffies) 自 /proc/stat
-static unsigned long long get_system_total_ticks(void) {
-    char buf[256];
-    unsigned long long user, nice, system, idle, iowait, irq, softirq, steal;
-    FILE *f = fopen("/proc/stat", "r");
-    if (!f) return 0;
-    if (fgets(buf, sizeof(buf), f)) {
-        sscanf(buf, "cpu  %llu %llu %llu %llu %llu %llu %llu %llu",
-               &user, &nice, &system, &idle, &iowait, &irq, &softirq, &steal);
-    }
-    fclose(f);
-    return user + nice + system + idle + iowait + irq + softirq + steal;
-}
-
-// 增加排序需要的比較函數
-static int sort_by_mem(const void *a, const void *b) {
-    return (int)((*(proc_node_t **)b)->info.rss - (*(proc_node_t **)a)->info.rss);
-}
-
-static int sort_by_cpu(const void *a, const void *b) {
-    unsigned long long cpu_a = (*(proc_node_t **)a)->info.utime + (*(proc_node_t **)a)->info.stime;
-    unsigned long long cpu_b = (*(proc_node_t **)b)->info.utime + (*(proc_node_t **)b)->info.stime;
-    // 這裡用 prev 的差值排序會更準確，但結構受限時先以總量排或傳入 diff 資料
-    return (cpu_b > cpu_a) - (cpu_b < cpu_a);
+    return buf;
 }
 
 static void show_top_with_cpu(void) {
-    proc_node_t *prev_list = get_proc_list();
-    unsigned long long prev_total_ticks = get_system_total_ticks();
-    unsigned long total_mem = get_total_mem();
-    struct termios old_termios;
-    char sort_mode = 'P'; 
-    
-    set_termios_to_raw(STDIN_FILENO, &old_termios, 0);
+    proc_node_t *prev_list = NULL;
+    unsigned long long prev_ticks = 0;
+    struct termios old_t;
+    struct sysinfo si;
+    sysinfo(&si);
+    unsigned long total_mem = (si.totalram * si.mem_unit) / 1024;
+
+    set_termios_to_raw(STDIN_FILENO, &old_t, 0);
+    printf("\033[2J\033[?25l");
 
     while (1) {
         struct pollfd pfd = { STDIN_FILENO, POLLIN, 0 };
-        proc_node_t *curr_list;
-        unsigned long long curr_total_ticks;
-        unsigned long long system_diff;
-        struct sysinfo s_info;
-        proc_node_t **sort_array;
-        int count = 0, idx = 0;
-        char *uptime;
+        proc_node_t *curr_list = fetch_proc_list();
+        unsigned long long curr_ticks = 0;
+        FILE *f = fopen("/proc/stat", "r");
+        if (f) {
+            unsigned long long u, n, s, i, io, ir, sir, st;
+            if (fscanf(f, "cpu %llu %llu %llu %llu %llu %llu %llu %llu", &u,&n,&s,&i,&io,&ir,&sir,&st) == 8)
+                curr_ticks = u+n+s+i+io+ir+sir+st;
+            fclose(f);
+        }
+        unsigned long long diff = curr_ticks - prev_ticks;
 
         if (poll(&pfd, 1, 0) > 0) {
             char c;
-            if (read(STDIN_FILENO, &c, 1) > 0) {
+            if (read(0, &c, 1) > 0) {
                 c = toupper(c);
-                if (c == 'Q') break;
-                if (c == 'M' || c == 'P') sort_mode = c;
-                if (c == 'T') { // 進入臨時樹狀模式
-                    printf("\033[H\033[J"); // 清屏
-                    printf("Process Tree View (Current Snap):\n");
-                    printf("----------------------------------\n");
-                    print_tree_fast(curr_list, 0, 0);
-                    printf("\nPress any key to return to Top mode...");
-                    
-                    // 等待使用者按鍵
-                    poll(&pfd, 1, -1); 
-                    read(STDIN_FILENO, &c, 1);
-                    continue; // 繼續 Top 刷新
-                }
+                if (c == 'Q') { free_proc_list(curr_list); break; }
+                if (c == 'T') { g_view_mode = !g_view_mode; printf("\033[2J"); }
+                if (strchr("PMIVOUSC", c)) g_sort_mode = c;
                 if (c == 'K') {
-                    tcsetattr(STDIN_FILENO, TCSANOW, &old_termios);
-                    printf("\nEnter PID to kill: ");
+                    // 1. 暫時恢復原本的終端機設定，並顯示游標
+                    tcsetattr(STDIN_FILENO, TCSANOW, &old_t);
+                    printf("\033[?25h\033[H\033[J"); // 移動到頂部並清空，方便輸入
+                    
+                    printf("\e[1;31m[KILL PROCESS]\e[0m\n");
+                    printf("Enter PID to kill (or 0 to cancel): ");
+                    
                     char buf[16];
+                    fflush(stdout);
                     if (fgets(buf, sizeof(buf), stdin)) {
                         int pid_to_kill = atoi(buf);
-                        if (pid_to_kill > 0) kill(pid_to_kill, SIGTERM);
+                        if (pid_to_kill > 0) {
+                            if (kill(pid_to_kill, SIGTERM) == 0) {
+                                printf("Sent SIGTERM to PID %d\n", pid_to_kill);
+                            } else {
+                                printf("Kill failed: %s\n", strerror(errno));
+                            }
+                            sleep(1); // 讓使用者看一下結果
+                        }
                     }
-                    set_termios_to_raw(STDIN_FILENO, &old_termios, 0);
+
+                    // 2. 切回 Raw mode 並再次隱藏游標
+                    set_termios_to_raw(STDIN_FILENO, &old_t, 0);
+                    printf("\033[?25l\033[2J");
                 }
             }
         }
 
-        curr_list = get_proc_list();
-        curr_total_ticks = get_system_total_ticks();
-        system_diff = curr_total_ticks - prev_total_ticks;
-        sysinfo(&s_info);
-        
-        for (proc_node_t *n = curr_list; n; n = n->next) count++;
-        sort_array = xmalloc(sizeof(proc_node_t *) * count);
-        for (proc_node_t *n = curr_list; n; n = n->next) sort_array[idx++] = n;
+        sysinfo(&si);
+        printf("\033[H\e[1;36m[MY_PROC]\e[0m Mode: \e[1;33m%s\e[0m | Sort By: \e[1;32m%s\e[0m\033[K\n", 
+               g_view_mode ? "TREE" : "LIST", get_sort_label());
+        printf("Mem: %luK total, %luK free | Load: %.2f\033[K\n", 
+               total_mem, (si.freeram * si.mem_unit)/1024, si.loads[0]/65536.0);
 
-        qsort(sort_array, count, sizeof(proc_node_t *), (sort_mode == 'M') ? sort_by_mem : sort_by_cpu);
+        if (g_view_mode == VIEW_TREE) {
+            printf("\n%-7s %-15s %-4s %9s %6s %6s\033[K\n", "PID", "COMMAND", "STAT", "RSS", "CPU%", "MEM%");
+            printf("------------------------------------------------------------\033[K\n");
+            print_tree_rich(curr_list, prev_list, diff, 0, 0, total_mem);
+        } else {
+            int cnt = 0;
+            for (proc_node_t *n = curr_list; n; n = n->next) cnt++;
+            proc_node_t **arr = xzalloc(sizeof(void*) * cnt);
+            cnt = 0;
+            for (proc_node_t *n = curr_list; n; n = n->next) arr[cnt++] = n;
+            qsort(arr, cnt, sizeof(void*), sort_func);
 
-        uptime = get_uptime_str();
-        printf("\033[H\033[J");
-        // 修正 Load Average 顯示
-        printf("Uptime: %s | Load: %.2f, %.2f, %.2f\n", uptime, 
-               s_info.loads[0]/65536.0, s_info.loads[1]/65536.0, s_info.loads[2]/65536.0);
-        printf("Mem: %luK total, %luK free | Sort: [%s]\n", total_mem, (s_info.freeram * s_info.mem_unit)/1024, (sort_mode == 'P' ? "CPU" : "MEM"));
-        free(uptime);
 
-        // 整合 print_list 的資訊：加入 VSZ
-        printf("\n%-6s %-10s %-4s %-8s %-8s %-6s %-6s %-15s\n", 
-               "PID", "USER", "STAT", "VSZ", "RSS", "%CPU", "%MEM", "COMMAND");
-        printf("----------------------------------------------------------------------\n");
+            // 修改後的 Header，將 PPID 放在 PID 之後
+            printf("\n%-6s %-6s %-4s %-10s %-4s %-4s %-10s %-6s %-6s %-8s %-15s\033[K\n", 
+                "PID", "PPID", "THR", "USER", "STAT", "NI", "RSS", "%CPU", "%MEM", "TIME", "COMMAND");
+            printf("----------------------------------------------------------------------------------------------------\033[K\n");
 
-        for (int i = 0; i < count && i < 20; i++) {
-            proc_node_t *curr = sort_array[i];
-            double cpu_pcnt = 0.0;
-            double mem_pcnt = (total_mem > 0) ? ((double)curr->info.rss * 100.0 / total_mem) : 0.0;
-            struct passwd *pw = getpwuid(curr->info.uid);
-            const char *user = pw ? pw->pw_name : "unknown";
-
-            if (prev_list && system_diff > 0) {
-                // ...現有的 CPU 計算邏輯...
-                for (proc_node_t *p = prev_list; p; p = p->next) {
-                    if (p->info.pid == curr->info.pid) {
-                        unsigned long diff = (curr->info.utime + curr->info.stime) - (p->info.utime + p->info.stime);
-                        cpu_pcnt = (double)diff * 100.0 / system_diff;
-                        break;
-                    }
-                }
+            for (int i = 0; i < cnt && i < 28; i++) {
+                proc_node_t *cn = arr[i];
+                struct passwd *pw = getpwuid(cn->info.uid);
+                double cp = calc_cpu(cn, prev_list, diff);
+                double me = (total_mem > 0) ? (cn->info.rss * 100.0 / total_mem) : 0.0;
+                
+                // 渲染每一行數據
+                printf("%-6d %-6d %-4d %-10.10s %-4c %-4d %-10lu %-6.1f %-6.1f %-8s %-15s\033[K\n", 
+                    cn->info.pid,
+                    cn->info.ppid,          // 新增 PPID
+                    cn->info.threads, 
+                    pw ? pw->pw_name : "???",
+                    cn->info.state,
+                    cn->info.nice,
+                    cn->info.rss,
+                    cp,
+                    me,
+                    get_time_str(cn->info.start_time), // 這是你之前算的行程存活時間
+                    cn->info.comm);
             }
 
-            // 輸出包含 VmSize (VSZ)
-            printf("%-6d %-10s %-4c %-8lu %-8lu %-6.1f %-6.1f %-15s\n", 
-                   curr->info.pid, user, curr->info.state, 
-                   curr->info.vmsize, curr->info.rss,
-                   cpu_pcnt, mem_pcnt, curr->info.comm);
+            /*printf("\n%-6s %-6s %-10s %-4s %-8s %-8s %-5s %-5s %-15s\033[K\n", 
+                   "PID", "PPID", "USER", "STAT", "VSZ", "RSS", "%CPU", "%MEM", "COMMAND");
+            printf("--------------------------------------------------------------------------------\033[K\n");
+            for (int i = 0; i < cnt && i < 28; i++) {
+                proc_node_t *cn = arr[i];
+                struct passwd *pw = getpwuid(cn->info.uid);
+                printf("%-6d %-6d %-10s %-4c %-8lu %-8lu %-5.1f %-5.1f %-15s\033[K\n", 
+                       cn->info.pid, cn->info.ppid, pw ? pw->pw_name : "???", 
+                       cn->info.state, cn->info.vmsize, cn->info.rss, calc_cpu(cn, prev_list, diff), 
+                       (total_mem > 0) ? (cn->info.rss * 100.0 / total_mem) : 0.0, cn->info.comm);
+            }*/
+            free(arr);
         }
+        printf("\033[J\n\e[7m SORT: (P)CPU (M)RSS (V)VSZ (I)PID (O)PPID (U)USER (S)STAT (C)CMD | (T)TREE (K)KILL (Q)QUIT \e[0m\033[K");
+        fflush(stdout);
 
-        printf("\n(Q:Quit, M:Sort Mem, P:Sort CPU, T:Tree, K:Kill)\n");
-
-        free(sort_array);
         if (prev_list) free_proc_list(prev_list);
         prev_list = curr_list;
-        prev_total_ticks = curr_total_ticks;
-        poll(&pfd, 1, 1000); 
+        prev_ticks = curr_ticks;
+        poll(&pfd, 1, 1000);
     }
-    tcsetattr(STDIN_FILENO, TCSANOW, &old_termios);
+    printf("\033[?25h\033[2J\033[H");
+    tcsetattr(0, TCSANOW, &old_t);
 }
 
+
+
+/* 進入點：處理參數與預設行為 */
 int my_proc_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
 int my_proc_main(int argc, char **argv)
 {
-    unsigned opts = getopt32(argv, "ts");
+    unsigned opts;
+    // 禁用 stdout 快取以獲得即時流暢感
+    setvbuf(stdout, NULL, _IONBF, 0);
     
-    // 如果沒有參數，或者有 -s 參數，預設進入 Top 模式
-    if (argc == 1 || (opts & 2)) {
-        show_top_with_cpu();
+    // 解析參數：-t (Tree), -s (Top/Stats)
+    opts = getopt32(argv, "ts");
+
+    if (opts & 1) { // -t: 單次樹狀快照
+        proc_node_t *list = fetch_proc_list();
+        printf("Process Tree Snapshot:\n");
+        print_tree_rich(list, NULL, 0, 0, 0, 0); // 靜態快照不計 CPU/MEM%
+        free_proc_list(list);
         return EXIT_SUCCESS;
     }
 
-    // 處理 -t 參數 (Tree View)
-    if (opts & 1) {
-        proc_node_t *head = get_proc_list();
-        printf("Process Tree:\n");
-        print_tree_fast(head, 0, 0);
-        free_proc_list(head);
-        return EXIT_SUCCESS;
-    }
-
-    // 其他情況（雖然在此邏輯下不太會發生）顯示一般列表
-    proc_node_t *head = get_proc_list();
-    print_list(head);
-    free_proc_list(head);
+    // 預設或 -s: 進入即時互動模式
+    show_top_with_cpu();
 
     return EXIT_SUCCESS;
 }
-
-// 建議優化 show_top_with_cpu 內的搜尋邏輯
-// 可以增加一個簡單的快取或至少在 my_proc_main 中呼叫它
