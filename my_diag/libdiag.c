@@ -22,7 +22,7 @@ long diag_get_val(const char *buf, const char *key) {
 
 /* --- 行程資源分析模組 (服務 diag_proc) --- */
 
-int diag_read_proc(int pid, diag_proc_t *p) {
+/*int diag_read_proc(int pid, diag_proc_t *p) {
     char path[64];
     char *buf;
     
@@ -56,6 +56,58 @@ int diag_read_proc(int pid, diag_proc_t *p) {
         p->rss = diag_get_val(buf, "VmRSS");
         free(buf);
     }
+    return 0;
+}*/
+
+int diag_read_proc(int pid, diag_proc_t *p) {
+    char path[64];
+    char *buf;
+    
+    memset(p, 0, sizeof(diag_proc_t));
+    p->pid = pid;
+
+    // 1. 讀取 /proc/[pid]/stat (涵蓋大部分欄位)
+    snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+    buf = xmalloc_open_read_close(path, NULL);
+    if (buf) {
+        char *s_end = strrchr(buf, ')'); // 找最後一個括號
+        char *s_start = strchr(buf, '(');
+        
+        if (s_start && s_end) {
+            // 解析名稱 (comm)
+            int len = s_end - s_start - 1;
+            if (len > sizeof(p->comm) - 1) len = sizeof(p->comm) - 1;
+            strncpy(p->comm, s_start + 1, len);
+            p->comm[len] = '\0';
+
+            /* 
+               從 s_end + 2 開始解析欄位（跳過 ") "）
+               對應 stat 格式索引 (從第 3 個欄位 state 開始):
+               %c(3) %d(4:ppid) %*d(5) %*d(6) %*d(7) %*d(8) %*u(9) %*u(10) %*u(11) %*u(12) %*u(13) 
+               %lu(14:utime) %lu(15:stime) %*d(16) %*d(17) 
+               %d(18:priority) %d(19:nice) %d(20:threads) %*d(21) %llu(22:starttime)
+            */
+            sscanf(s_end + 2, 
+                   "%c %d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu %*d %*d %d %d %d %*d %llu",
+                   &p->state, &p->ppid, &p->utime, &p->stime, 
+                   &p->priority, &p->nice, &p->threads, &p->start_time);
+        }
+        free(buf);
+    }
+
+    // 2. 獲取記憶體資訊 (雖然 stat 有 rss，但 status 的單位通常較準確，或繼續用你的 diag_get_val)
+    // 技巧：如果你追求極致效能，stat 的第 23 欄位其實就是 RSS (以 pages 為單位)
+    snprintf(path, sizeof(path), "/proc/%d/status", pid);
+    buf = xmalloc_open_read_close(path, NULL);
+    if (buf) {
+        p->vmsize = diag_get_val(buf, "VmSize");
+        p->rss = diag_get_val(buf, "VmRSS");
+        
+        // 額外資訊：UID (如果你不想用額外的系統呼叫)
+        p->uid = diag_get_val(buf, "Uid"); // diag_get_val 通常會抓第一個數字
+        free(buf);
+    }
+    
     return 0;
 }
 

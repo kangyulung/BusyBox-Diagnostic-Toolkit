@@ -9,11 +9,15 @@ typedef struct {
     int ppid;
     unsigned int uid;
     char state;
-    char comm[32];
+    char comm[64];
     unsigned long vmsize;
     unsigned long rss;
     unsigned long utime;
     unsigned long stime;
+    int threads;            /* 第 20 欄位：執行緒數量 */
+    int priority;           /* 第 18 欄位：核心優先權 */
+    int nice;               /* 第 19 欄位：Nice 值 (-20 ~ 19) */
+    unsigned long long start_time; /* 第 22 欄位：啟動時間 (jiffies) */
 } diag_proc_t;
 
 /* 檔案系統資訊結構 */
