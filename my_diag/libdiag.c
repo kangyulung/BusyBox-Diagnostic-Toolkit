@@ -4,10 +4,9 @@
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <sys/sysinfo.h>
 
-/* --- 內部通用解析工具 --- */
-
-// 在 buffer 中尋找特定 Key 並回傳指向 Value 的指標
+/* 在緩衝區中找出對應 key 的起始位置，並跳過分隔符號 */
 char* diag_find_key(const char *buf, const char *key) {
     char *ptr = strstr(buf, key);
     if (ptr) {
@@ -18,105 +17,48 @@ char* diag_find_key(const char *buf, const char *key) {
     return NULL;
 }
 
-// 提取字串中的長整數數值
+/* 取得緩衝區中 key 對應的長整型數值 */
 long diag_get_val(const char *buf, const char *key) {
     char *ptr = diag_find_key(buf, key);
     return ptr ? atol(ptr) : -1;
 }
 
-/* --- 行程資源分析模組 (服務 diag_proc) --- */
+/* 從 /proc/stat 讀取 CPU 總體時間標記 (CPU ticks) */
+unsigned long long get_cpu_usage_ticks(void) {
+    unsigned long long utime, ntime, stime, itime, iowtime, irq, sirq, steal;
+    char buf[256];
+    FILE *fp = fopen_for_read("/proc/stat");
+    if (!fp) return 0;
 
-/*int diag_read_proc(int pid, diag_proc_t *p) {
-    char path[64];
-    char *buf;
-    
-    memset(p, 0, sizeof(diag_proc_t));
-    p->pid = pid;
-
-    // 1. 讀取 /proc/[pid]/stat 獲取 PPID 與名稱
-    snprintf(path, sizeof(path), "/proc/%d/stat", pid);
-    buf = xmalloc_open_read_close(path, NULL);
-    if (buf) {
-        char *s = strrchr(buf, ')'); // 找最後一個括號以精確定位
-        if (s) {
-            //sscanf(s + 2, "%*c %d", &p->ppid);
-            sscanf(s + 2, "%*c %d %*d %*d %*d %*d %*d %*d %*d %*d %*d %lu %lu", 
-                   &p->ppid, &p->utime, &p->stime);
-            char *start = strchr(buf, '(');
-            if (start) {
-                int len = s - start - 1;
-                len = (len > 31) ? 31 : len;
-                strncpy(p->comm, start + 1, len);
-            }
+    if (fgets(buf, sizeof(buf), fp)) {
+        /* 解析 /proc/stat 的第一行 (cpu 總計) */
+        if (sscanf(buf, "cpu %llu %llu %llu %llu %llu %llu %llu %llu",
+            &utime, &ntime, &stime, &itime, &iowtime, &irq, &sirq, &steal) < 4) {
+            fclose(fp);
+            return 0;
         }
-        free(buf);
     }
-
-    // 2. 讀取 /proc/[pid]/status 獲取記憶體
-    snprintf(path, sizeof(path), "/proc/%d/status", pid);
-    buf = xmalloc_open_read_close(path, NULL);
-    if (buf) {
-        p->vmsize = diag_get_val(buf, "VmSize");
-        p->rss = diag_get_val(buf, "VmRSS");
-        free(buf);
-    }
-    return 0;
-}*/
-
-int diag_read_proc(int pid, diag_proc_t *p) {
-    char path[64];
-    char *buf;
-    
-    memset(p, 0, sizeof(diag_proc_t));
-    p->pid = pid;
-
-    // 1. 讀取 /proc/[pid]/stat (涵蓋大部分欄位)
-    snprintf(path, sizeof(path), "/proc/%d/stat", pid);
-    buf = xmalloc_open_read_close(path, NULL);
-    if (buf) {
-        char *s_end = strrchr(buf, ')'); // 找最後一個括號
-        char *s_start = strchr(buf, '(');
-        
-        if (s_start && s_end) {
-            // 解析名稱 (comm)
-            int len = s_end - s_start - 1;
-            if (len > sizeof(p->comm) - 1) len = sizeof(p->comm) - 1;
-            strncpy(p->comm, s_start + 1, len);
-            p->comm[len] = '\0';
-
-            /* 
-               從 s_end + 2 開始解析欄位（跳過 ") "）
-               對應 stat 格式索引 (從第 3 個欄位 state 開始):
-               %c(3) %d(4:ppid) %*d(5) %*d(6) %*d(7) %*d(8) %*u(9) %*u(10) %*u(11) %*u(12) %*u(13) 
-               %lu(14:utime) %lu(15:stime) %*d(16) %*d(17) 
-               %d(18:priority) %d(19:nice) %d(20:threads) %*d(21) %llu(22:starttime)
-            */
-            sscanf(s_end + 2, 
-                   "%c %d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu %*d %*d %d %d %d %*d %llu",
-                   &p->state, &p->ppid, &p->utime, &p->stime, 
-                   &p->priority, &p->nice, &p->threads, &p->start_time);
-        }
-        free(buf);
-    }
-
-    // 2. 獲取記憶體資訊 (雖然 stat 有 rss，但 status 的單位通常較準確，或繼續用你的 diag_get_val)
-    // 技巧：如果你追求極致效能，stat 的第 23 欄位其實就是 RSS (以 pages 為單位)
-    snprintf(path, sizeof(path), "/proc/%d/status", pid);
-    buf = xmalloc_open_read_close(path, NULL);
-    if (buf) {
-        p->vmsize = diag_get_val(buf, "VmSize");
-        p->rss = diag_get_val(buf, "VmRSS");
-        
-        // 額外資訊：UID (如果你不想用額外的系統呼叫)
-        p->uid = diag_get_val(buf, "Uid"); // diag_get_val 通常會抓第一個數字
-        free(buf);
-    }
-    
-    return 0;
+    fclose(fp);
+    return utime + ntime + stime + itime + iowtime + irq + sirq + steal;
 }
 
-/* --- 檔案系統健康檢測 (服務 diag_fs) --- */
+/* 將 CPU 時間標記轉換為人類可讀的格式 (HH:MM:SS 或 MM:SS.cc) */
+char* diag_format_time(char *buf, unsigned long long utime, unsigned long long stime) {
+    unsigned long long total_ticks = utime + stime;
+    unsigned int hz = bb_clk_tck();
+    unsigned long s = (total_ticks / hz);
+    unsigned long m = s / 60;
+    s %= 60;
+    if (m >= 60)
+        snprintf(buf, 16, "%lu:%02lu:%02lu", m / 60, m % 60, s);
+    else
+        snprintf(buf, 16, "%02lu:%02lu.%02llu", m, s, (total_ticks * 100 / hz) % 100);
+    return buf;
+}
 
+/* --- 檔案系統與連線監測 --- */
+
+/* 取得指定路徑的檔案系統使用狀況 (Inodes 與 磁碟空間) */
 int diag_read_fs(const char *path, diag_fs_t *f) {
     struct statfs s;
     if (statfs(path, &s) != 0) return -1;
@@ -130,9 +72,7 @@ int diag_read_fs(const char *path, diag_fs_t *f) {
     return 0;
 }
 
-/* --- 網路連線狀態 (服務 diag_net) --- */
-
-// TCP 狀態機對照表
+/* 將 TCP 狀態代碼轉換為字串描述 */
 const char* diag_get_tcp_state(int state) {
     static const char *tcp_states[] = {
         "UNKNOWN", "ESTABLISHED", "SYN_SENT", "SYN_RECV", "FIN_WAIT1",
@@ -207,4 +147,121 @@ void diag_free_frag(diag_frag_t *f)
         free(f->extents);
         f->extents = NULL;
     }
+}
+/* --- 系統快照 (Memory & Load) --- */
+
+/* 獲取當前系統資源快照，包含記憶體、負載與 CPU 標記 */
+void diag_get_sys_snap(diag_sys_snap_t *snap) {
+    struct sysinfo si;
+    if (sysinfo(&si) == 0) {
+        snap->total_mem_kb = (si.totalram * (unsigned long long)si.mem_unit) / 1024;
+        snap->free_mem_kb = (si.freeram * (unsigned long long)si.mem_unit) / 1024;
+        snap->load_avg[0] = si.loads[0] / 65536.0;
+        snap->load_avg[1] = si.loads[1] / 65536.0;
+        snap->load_avg[2] = si.loads[2] / 65536.0;
+    }
+    snap->cpu_total_ticks = get_cpu_usage_ticks();
+}
+
+/* --- UI 終端模式切換 --- */
+
+/* 切換至 Raw 模式 (禁用緩衝與回顯)，用於即時監控介面 */
+void diag_ui_mode_raw(struct termios *old_t) {
+
+    set_termios_to_raw(STDIN_FILENO, old_t, 0);
+    printf(DIAG_HIDE DIAG_CLR_SCR);
+    fflush(stdout);
+}
+
+/* 恢復標準終端模式並顯示游標 */
+void diag_ui_mode_normal(struct termios *old_t) {
+
+    printf(DIAG_SHOW);
+    tcsetattr(STDIN_FILENO, TCSANOW, old_t);
+    fflush(stdout);
+}
+
+/* 在 UI 執行期間提示使用者輸入整數 (會暫時恢復正常終端模式) */
+int diag_ui_ask_int(const char *prompt, struct termios *old_t) {
+
+    char buf[32];
+    int res = 0;
+    diag_ui_mode_normal(old_t);
+    printf("\n%s", prompt);
+    fflush(stdout);
+    
+    if (fgets(buf, sizeof(buf), stdin)) {
+        res = atoi(buf);
+    }
+
+    diag_ui_mode_raw(old_t);
+    return res;
+}
+
+/* 二元搜尋輔助函式：根據 ID 搜尋節點 */
+static diag_node_base_t* find_base_node(diag_node_base_t **arr, int size, int id) {
+    int low = 0, high = size - 1;
+    while (low <= high) {
+        int mid = (low + high) / 2;
+        if (arr[mid]->id == id) return arr[mid];
+        if (arr[mid]->id < id) low = mid + 1;
+        else high = mid - 1;
+    }
+    return NULL;
+}
+
+/* 排序比較函式：根據 ID 升序排序 */
+static int diag_node_cmp(const void *a, const void *b) {
+    return (*(diag_node_base_t**)a)->id - (*(diag_node_base_t**)b)->id;
+}
+
+/* 將鏈結串列轉換為指標陣列以便於排序與隨機存取 */
+diag_node_base_t** diag_nodes_to_array(diag_node_base_t *list, int *out_cnt) {
+    int cnt = 0;
+    diag_node_base_t *curr = list;
+    diag_node_base_t **arr;
+
+    while (curr) {
+        cnt++;
+        curr = curr->next;
+    }
+
+    if (cnt == 0) {
+        *out_cnt = 0;
+        return NULL;
+    }
+
+    arr = xmalloc(sizeof(diag_node_base_t*) * cnt);
+    curr = list;
+    for (int i = 0; i < cnt; i++) {
+        arr[i] = curr;
+        curr = curr->next;
+    }
+
+    *out_cnt = cnt;
+    return arr;
+}
+
+/* 根據 parent_id 將扁平串列重組為樹狀結構 */
+diag_node_base_t* diag_link_tree(diag_node_base_t **nodes, int count) {
+    
+    diag_node_base_t *root_list = NULL;
+    qsort(nodes, count, sizeof(diag_node_base_t*), diag_node_cmp);
+
+    for (int i = count - 1; i >= 0; i--) {
+        diag_node_base_t *curr = nodes[i];
+        diag_node_base_t *parent = (curr->parent_id > 0) ? 
+                                   find_base_node(nodes, count, curr->parent_id) : NULL;
+
+        if (parent && parent != curr) {
+            /* 建立親子關聯 */
+            curr->sibling = parent->child;
+            parent->child = curr;
+        } else {
+            /* 無父節點或指向自身者歸類為根節點 */
+            curr->sibling = root_list;
+            root_list = curr;
+        }
+    }
+    return root_list;
 }
