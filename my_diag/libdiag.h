@@ -4,37 +4,57 @@
 #include "libbb.h"
 #include <linux/fiemap.h>
 
-/* 行程資訊結構 */
+/* ANSI 控制序列：用於 UI 渲染 */
+#define DIAG_CLR_EOL "\033[K"   /* 清除至行尾 */
+#define DIAG_CLR_SCR "\033[H"   /* 游標移至左上角 */
+#define DIAG_RESET   "\e[0m"    /* 重置顏色與格式 */
+#define DIAG_RED     "\e[1;31m"
+#define DIAG_GREEN   "\e[1;32m"
+#define DIAG_YELLOW  "\e[1;33m"
+#define DIAG_CYAN    "\e[1;36m"
+#define DIAG_HIDE    "\033[?25l" /* 隱藏游標 */
+#define DIAG_SHOW    "\033[?25h" /* 顯示游標 */
+
+/* 樹狀結構基礎節點：用於建立行程間的父子關係 */
+typedef struct diag_node_base {
+    int id;                         /* 節點唯一識別碼 (如 PID) */
+    int parent_id;                  /* 父節點識別碼 (如 PPID) */
+    struct diag_node_base *child;   /* 第一個子節點 */
+    struct diag_node_base *sibling; /* 下一個兄弟節點 */
+    struct diag_node_base *next;    /* 線性鏈表指標，用於遍歷所有節點 */
+} diag_node_base_t;
+
+/* 行程資訊結構 (解析自 /proc/[pid]/stat 與 status) */
 typedef struct {
     int pid;
     int ppid;
     unsigned int uid;
-    char state;
-    char comm[64];
-    unsigned long vmsize;
-    unsigned long rss;
-    unsigned long utime;
-    unsigned long stime;
-    int threads;            /* 第 20 欄位：執行緒數量 */
-    int priority;           /* 第 18 欄位：核心優先權 */
-    int nice;               /* 第 19 欄位：Nice 值 (-20 ~ 19) */
-    unsigned long long start_time; /* 第 22 欄位：啟動時間 (jiffies) */
+    char state;                     /* 行程狀態 (R, S, D, Z, T) */
+    char comm[64];                  /* 執行指令名稱 */
+    unsigned long vmsize;           /* 虛擬記憶體大小 (bytes) */
+    unsigned long rss;              /* 常駐記憶體大小 (bytes) */
+    unsigned long utime;            /* 用戶態 CPU 時間 (jiffies) */
+    unsigned long stime;            /* 核心態 CPU 時間 (jiffies) */
+    int threads;                    /* 執行緒數量 */
+    int priority;                   /* 核心優先權 */
+    int nice;                       /* Nice 值 (-20 ~ 19) */
+    unsigned long long start_time;  /* 系統啟動後的開機秒數 (jiffies) */
 } diag_proc_t;
 
-/* 檔案系統資訊結構 */
+/* 檔案系統資訊結構 (統計磁碟使用狀況) */
 typedef struct {
-    unsigned long total_inodes;  /* statfs.f_files */
-    unsigned long free_inodes;   /* statfs.f_ffree */
-    uint64_t total_bytes;        /* f_blocks * f_frsize */
-    uint64_t free_bytes;         /* f_bavail * f_frsize（非 root 可用） */
-    uint64_t free_bytes_priv;    /* f_bfree  * f_frsize（含 root 保留區） */
+    unsigned long total_inodes;
+    unsigned long free_inodes;
+    uint64_t total_bytes;           /* 總容量 */
+    uint64_t free_bytes;            /* 非 root 用戶可用空間 */
+    uint64_t free_bytes_priv;       /* 含 root 保留區的剩餘空間 */
 } diag_fs_t;
 
-/* 網路連線結構 */
+/* 網路連線狀態 (解析自 /proc/net/tcp) */
 typedef struct {
-    char local_addr[48];
-    char remote_addr[48];
-    int state;
+    char local_addr[48];            /* 本地端位址與埠號 */
+    char remote_addr[48];           /* 遠端位址與埠號 */
+    int state;                      /* TCP 狀態碼 */
 } diag_net_t;
 
 /* 單檔碎片分析結果 */
@@ -45,13 +65,33 @@ typedef struct {
 } diag_frag_t;
 
 /* 通用解析工具 */
+/* 系統狀態快照 (全域統計) */
+typedef struct {
+    unsigned long total_mem_kb;
+    unsigned long free_mem_kb;
+    double load_avg[3];             /* 1, 5, 15 分鐘平均負載 */
+    unsigned long long cpu_total_ticks; /* CPU 累計總滴答數 */
+} diag_sys_snap_t;
+
+/* 通用解析與格式化工具 */
 char* diag_find_key(const char *buf, const char *key);
 long diag_get_val(const char *buf, const char *key);
+unsigned long long get_cpu_usage_ticks(void);
+char* diag_format_time(char *buf, unsigned long long utime, unsigned long long stime);
 
-/* 各模組專用收集函數 */
-int diag_read_proc(int pid, diag_proc_t *p);
+/* 系統資訊採集函數 */
 int diag_read_fs(const char *path, diag_fs_t *f);
 const char* diag_get_tcp_state(int state);
+void diag_get_sys_snap(diag_sys_snap_t *snap);
+
+/* 終端 UI 模式控制 */
+void diag_ui_mode_raw(struct termios *old);    /* 開啟 Raw mode 以處理單鍵輸入 */
+void diag_ui_mode_normal(struct termios *old); /* 恢復標準終端模式 */
+int  diag_ui_ask_int(const char *prompt, struct termios *old); /* 彈出式詢問數值 */
+
+/* 樹狀結構建構工具 */
+diag_node_base_t** diag_nodes_to_array(diag_node_base_t *list, int *out_cnt);
+diag_node_base_t* diag_link_tree(diag_node_base_t **nodes, int count);
 
 /*
  * 對單一正規檔案執行 FIEMAP ioctl，填入 f->file_size 與 f->extent_count。
