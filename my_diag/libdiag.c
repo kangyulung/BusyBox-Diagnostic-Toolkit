@@ -1,5 +1,9 @@
 #include "libdiag.h"
 #include <sys/vfs.h>
+#include <linux/fs.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 
 /* --- 內部通用解析工具 --- */
 
@@ -137,4 +141,70 @@ const char* diag_get_tcp_state(int state) {
     };
     if (state < 1 || state > 11) return tcp_states[0];
     return tcp_states[state];
+}
+
+/* --- 檔案碎片分析（服務 diag_fs）--- */
+
+int diag_read_fragmentation(const char *path, diag_frag_t *f, int collect_extents)
+{
+    struct stat sb;
+    struct fiemap *fm;
+    int fd;
+
+    memset(f, 0, sizeof(*f));
+
+    /* O_NOFOLLOW：不追蹤符號連結，避免意外跨越掛載點 */
+    fd = open(path, O_RDONLY | O_NOFOLLOW);
+    if (fd < 0) return -1;
+
+    if (fstat(fd, &sb) != 0) { close(fd); return -1; }
+    if (!S_ISREG(sb.st_mode)) { close(fd); errno = EINVAL; return -1; }
+    f->file_size = (uint64_t)sb.st_size;
+
+    /* 第一次呼叫：fm_extent_count=0 → 核心只回傳 fm_mapped_extents（extent 總數），不複製陣列 */
+    fm = xzalloc(sizeof(*fm));
+    fm->fm_start        = 0;
+    fm->fm_length       = FIEMAP_MAX_OFFSET;
+    fm->fm_flags        = 0;
+    fm->fm_extent_count = 0;
+
+    if (ioctl(fd, FS_IOC_FIEMAP, fm) != 0) {
+        free(fm);
+        close(fd);
+        return -1;
+    }
+    f->extent_count = fm->fm_mapped_extents;
+
+    if (collect_extents && f->extent_count > 0) {
+        /* 第二次呼叫：配置足夠大的緩衝區取回所有 extent 詳細資料 */
+        size_t sz = sizeof(*fm) + sizeof(struct fiemap_extent) * f->extent_count;
+        free(fm);
+        fm = xzalloc(sz);
+        fm->fm_start        = 0;
+        fm->fm_length       = FIEMAP_MAX_OFFSET;
+        fm->fm_flags        = 0;
+        fm->fm_extent_count = f->extent_count;
+
+        if (ioctl(fd, FS_IOC_FIEMAP, fm) != 0) {
+            free(fm);
+            close(fd);
+            return -1;
+        }
+        f->extents = xmalloc(sizeof(struct fiemap_extent) * fm->fm_mapped_extents);
+        memcpy(f->extents, fm->fm_extents,
+               sizeof(struct fiemap_extent) * fm->fm_mapped_extents);
+        f->extent_count = fm->fm_mapped_extents;
+    }
+
+    free(fm);
+    close(fd);
+    return 0;
+}
+
+void diag_free_frag(diag_frag_t *f)
+{
+    if (f && f->extents) {
+        free(f->extents);
+        f->extents = NULL;
+    }
 }

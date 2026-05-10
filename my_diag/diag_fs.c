@@ -10,7 +10,7 @@
 //kbuild:lib-$(CONFIG_MY_FS) += diag_fs.o
 //kbuild:lib-$(CONFIG_MY_FS) += libdiag.o
 
-//usage:#define my_fs_trivial_usage "[-h] [-i] [-r] [-t TYPE] [-x TYPE] [PATH]..."
+//usage:#define my_fs_trivial_usage "[-h] [-i] [-r] [-t TYPE] [-x TYPE] [-f FILE] [-F PATH] [PATH]..."
 //usage:#define my_fs_full_usage "\n\n"
 //usage:       "Show filesystem disk space and inode usage\n"
 //usage:     "\n	-h		Human-readable sizes (K/M/G/T)"
@@ -18,9 +18,12 @@
 //usage:     "\n	-r		Show dual Use% (user/real) and reserved blocks"
 //usage:     "\n	-t TYPE	Only show filesystems of TYPE"
 //usage:     "\n	-x TYPE	Exclude filesystems of TYPE"
+//usage:     "\n	-f FILE	Fragmentation analysis for FILE"
+//usage:     "\n	-F PATH	Fragmentation statistics for filesystem at PATH"
 
 #include "libbb.h"
 #include "libdiag.h"
+#include <ftw.h>
 
 /* 掛載點清單節點（解析自 /proc/mounts） */
 typedef struct mount_node {
@@ -415,17 +418,183 @@ static void print_entries(const fs_entry_t *e, int n, int human, int inode, int 
     }
 }
 
+/* ── L1：-f FILE 單檔碎片分析 ── */
+
+static void print_file_frag(const char *path)
+{
+    diag_frag_t f;
+    struct statfs sfs;
+    uint64_t blk_size, blocks, expected_phy;
+    uint32_t i;
+
+    if (diag_read_fragmentation(path, &f, 1) != 0) {
+        bb_perror_msg("%s", path);
+        return;
+    }
+
+    /* f_bsize：filesystem 宣告的 block size，filefrag 用此欄位換算 */
+    blk_size = (statfs(path, &sfs) == 0 && sfs.f_bsize > 0) ? (uint64_t)sfs.f_bsize : 4096;
+    blocks   = (f.file_size + blk_size - 1) / blk_size;
+
+    printf("File size of %s is %llu (%llu block%s of %llu bytes)\n",
+           path,
+           (unsigned long long)f.file_size,
+           (unsigned long long)blocks,
+           blocks == 1 ? "" : "s",
+           (unsigned long long)blk_size);
+
+    if (f.extent_count > 0) {
+        printf(" ext:     logical_offset:        physical_offset: length:   expected: flags:\n");
+        expected_phy = 0;
+        for (i = 0; i < f.extent_count; i++) {
+            struct fiemap_extent *e = &f.extents[i];
+            uint64_t log_start = e->fe_logical  / blk_size;
+            uint64_t log_end   = (e->fe_logical  + e->fe_length - 1) / blk_size;
+            uint64_t phy_start = e->fe_physical / blk_size;
+            uint64_t phy_end   = (e->fe_physical + e->fe_length - 1) / blk_size;
+            uint64_t len       = e->fe_length / blk_size;
+            char flags[64] = "", exp_str[24] = "";
+
+            if (i > 0 && phy_start != expected_phy)
+                snprintf(exp_str, sizeof(exp_str), "%llu", (unsigned long long)expected_phy);
+
+            if (e->fe_flags & FIEMAP_EXTENT_LAST)     strcat(flags, "last,eof");
+            if (e->fe_flags & FIEMAP_EXTENT_UNKNOWN)  strcat(flags, "unknown ");
+            if (e->fe_flags & FIEMAP_EXTENT_DELALLOC) strcat(flags, "delalloc ");
+            if (e->fe_flags & FIEMAP_EXTENT_ENCODED)  strcat(flags, "encoded ");
+
+            printf(" %3u:  %7llu..%8llu:  %9llu..%10llu: %6llu: %10s  %s\n",
+                   i,
+                   (unsigned long long)log_start, (unsigned long long)log_end,
+                   (unsigned long long)phy_start,  (unsigned long long)phy_end,
+                   (unsigned long long)len,
+                   exp_str, flags);
+
+            expected_phy = phy_start + len;
+        }
+    }
+
+    printf("%s: %u extent%s found\n", path,
+           f.extent_count, f.extent_count == 1 ? "" : "s");
+    diag_free_frag(&f);
+}
+
+/* ── L2：-F PATH 掛載點碎片統計 ── */
+
+#define L2_TOP_N 10
+
+struct l2_top_entry {
+    char     path[PATH_MAX];
+    uint32_t extents;
+    uint64_t size;
+};
+
+struct l2_ctx {
+    uint64_t            total;
+    uint64_t            frag;
+    uint64_t            dist[4];   /* [0]=1, [1]=2-4, [2]=5-16, [3]=17+ */
+    struct l2_top_entry top[L2_TOP_N];
+    int                 top_count;
+};
+
+static struct l2_ctx g_l2;
+
+static int l2_nftw_cb(const char *path, const struct stat *sb,
+                      int typeflag, struct FTW *ftwbuf)
+{
+    diag_frag_t f;
+    int i, min_idx;
+
+    (void)sb; (void)ftwbuf;
+    if (typeflag != FTW_F) return 0;
+
+    if (diag_read_fragmentation(path, &f, 0) != 0) return 0;
+
+    g_l2.total++;
+
+    if      (f.extent_count <= 1)  g_l2.dist[0]++;
+    else if (f.extent_count <= 4)  g_l2.dist[1]++;
+    else if (f.extent_count <= 16) g_l2.dist[2]++;
+    else                           g_l2.dist[3]++;
+
+    if (f.extent_count > 1) g_l2.frag++;
+
+    if (g_l2.top_count < L2_TOP_N) {
+        safe_strncpy(g_l2.top[g_l2.top_count].path, path, PATH_MAX);
+        g_l2.top[g_l2.top_count].extents = f.extent_count;
+        g_l2.top[g_l2.top_count].size    = f.file_size;
+        g_l2.top_count++;
+    } else {
+        /* 清單已滿：以 extent_count 最小的項目作為替換候選 */
+        min_idx = 0;
+        for (i = 1; i < L2_TOP_N; i++) {
+            if (g_l2.top[i].extents < g_l2.top[min_idx].extents)
+                min_idx = i;
+        }
+        if (f.extent_count > g_l2.top[min_idx].extents) {
+            safe_strncpy(g_l2.top[min_idx].path, path, PATH_MAX);
+            g_l2.top[min_idx].extents = f.extent_count;
+            g_l2.top[min_idx].size    = f.file_size;
+        }
+    }
+
+    return 0;
+}
+
+static int cmp_top_entry(const void *a, const void *b)
+{
+    const struct l2_top_entry *ea = (const struct l2_top_entry *)a;
+    const struct l2_top_entry *eb = (const struct l2_top_entry *)b;
+    return (ea->extents > eb->extents) ? -1 : (ea->extents < eb->extents) ? 1 : 0;
+}
+
+static void print_frag_stat(const char *path)
+{
+    double frag_pct;
+    int i;
+
+    memset(&g_l2, 0, sizeof(g_l2));
+    printf("Scanning %s ...\n\n", path);
+    nftw(path, l2_nftw_cb, 16, FTW_MOUNT | FTW_PHYS);
+
+    frag_pct = (g_l2.total > 0)
+               ? (double)g_l2.frag * 100.0 / (double)g_l2.total : 0.0;
+    printf("Scanned: %llu files  Fragmented: %llu (%.1f%%)\n\n",
+           (unsigned long long)g_l2.total,
+           (unsigned long long)g_l2.frag, frag_pct);
+
+    printf("Fragmentation distribution:\n");
+    printf("  %-10s  %s\n",   "Extents", "Files");
+    printf("  %-10s  %llu\n", "1",    (unsigned long long)g_l2.dist[0]);
+    printf("  %-10s  %llu\n", "2-4",  (unsigned long long)g_l2.dist[1]);
+    printf("  %-10s  %llu\n", "5-16", (unsigned long long)g_l2.dist[2]);
+    printf("  %-10s  %llu\n", "17+",  (unsigned long long)g_l2.dist[3]);
+
+    if (g_l2.top_count > 0) {
+        qsort(g_l2.top, g_l2.top_count, sizeof(g_l2.top[0]), cmp_top_entry);
+        printf("\nTop %d most fragmented:\n", g_l2.top_count);
+        printf("  %7s  %s\n", "Extents", "File");
+        for (i = 0; i < g_l2.top_count; i++)
+            printf("  %7u  %s\n", g_l2.top[i].extents, g_l2.top[i].path);
+    }
+}
+
 int my_fs_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
 int my_fs_main(int argc, char **argv)
 {
-    char    *opt_t = NULL, *opt_x = NULL;
-    unsigned opts     = getopt32(argv, "hirt:x:", &opt_t, &opt_x);
+    char    *opt_t = NULL, *opt_x = NULL, *opt_f = NULL, *opt_F = NULL;
+    unsigned opts     = getopt32(argv, "hirt:x:f:F:", &opt_t, &opt_x, &opt_f, &opt_F);
     int      human    = (opts & (1 << 0));
     int      inode    = (opts & (1 << 1));
     int      reserved = (opts & (1 << 2));
     int      has_t    = (opts & (1 << 3));
     int      has_x    = (opts & (1 << 4));
+    int      has_f    = (opts & (1 << 5));
+    int      has_F    = (opts & (1 << 6));
     argv += optind;
+
+    if (has_f) { print_file_frag(opt_f); return EXIT_SUCCESS; }
+    if (has_F) { print_frag_stat(opt_F); return EXIT_SUCCESS; }
 
     mount_node_t *mounts = get_mount_list();
     fs_entry_t   *entries;
