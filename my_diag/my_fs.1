@@ -1,0 +1,164 @@
+.\" vi: set sw=4 ts=4:
+.TH MY_FS 1 "2026-05-11" "BusyBox Diagnostic Toolkit" "User Commands"
+.SH NAME
+my_fs \- filesystem health checker: disk usage, inode analysis, and fragmentation
+.SH SYNOPSIS
+.B my_fs
+[\fIOPTION\fR]... [\fIPATH\fR]...
+.SH DESCRIPTION
+.B my_fs
+displays disk space usage and health information for one or more filesystems.
+Without path arguments, it reads
+.I /proc/mounts
+and reports all mounted physical filesystems (de-duplicated by
+.IR st_dev ,
+virtual filesystems with
+.I f_blocks
+== 0 are excluded).
+.PP
+Core features:
+.IP \(bu 2
+Disk usage analysis compatible with GNU
+.BR df (1)
+output format
+.IP \(bu 2
+Inode usage analysis compatible with
+.B df \-i
+.IP \(bu 2
+Dual-perspective Use% with root-reserved block information (Use%(user) and
+Use%(real) side by side)
+.IP \(bu 2
+Per-file FIEMAP extent analysis compatible with util-linux
+.BR filefrag (1)
+.IP \(bu 2
+Mount-point fragmentation statistics via
+.BR nftw (3)
+traversal with Top-N most fragmented files
+.IP \(bu 2
+Interactive TUI live-monitoring mode
+.SH OPTIONS
+.TP
+.B \-h
+Human-readable sizes.
+Capacity values are automatically scaled to K/M/G/T with ceiling round-up,
+matching the behavior of
+.BR df \-h .
+.TP
+.B \-i
+Inode mode.
+Displays Inodes / IUsed / IFree / IUse% instead of block counts,
+matching
+.BR df \-i .
+.TP
+.B \-r
+Dual-perspective reserved-block mode.
+Adds Use%(user), Use%(real), and RootResv columns to the output,
+making it immediately visible why
+.B df
+may show 100% while the system is still operational.
+.TP
+\fB\-t\fR \fITYPE\fR
+Show only filesystems of the given type (e.g.\& ext4, tmpfs).
+Matches the behavior of
+.BR df \-t .
+.TP
+\fB\-x\fR \fITYPE\fR
+Exclude filesystems of the given type.
+Matches the behavior of
+.BR df \-x .
+.TP
+\fB\-f\fR \fIFILE\fR
+Run a FIEMAP
+.BR ioctl (2)
+on the specified regular file and print all extents with their logical and
+physical offsets and lengths (in filesystem blocks).
+Output format is compatible with
+.BR "filefrag \-v" .
+Filesystems that do not support FIEMAP (e.g.\& tmpfs, overlayfs) produce an
+error message and exit.
+.TP
+\fB\-F\fR \fIPATH\fR
+Scan all regular files under the given mount point using
+.BR nftw (3)
+and report fragmentation statistics: distribution by extent count
+(1 / 2-4 / 5-16 / 17+) and the Top 10 most fragmented files.
+.TP
+.B \-s
+Interactive TUI mode.
+Clears the screen and refreshes all mount-point statistics once per second.
+.RS
+.PP
+Key bindings:
+.TP
+.B D
+Switch to disk capacity view (default)
+.TP
+.B I
+Switch to inode view
+.TP
+.B R
+Switch to dual Use% / reserved-block view
+.TP
+.B F
+Switch to fragmentation view.
+On first press (or re-press), scans
+.B /
+with
+.BR nftw (3)
+and caches the result; subsequent renders display the cached data.
+.TP
+.B H
+Toggle human-readable display
+.TP
+.B Q
+Quit and restore terminal state
+.RE
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Invalid argument or system call failure.
+.SH EXAMPLES
+.TP
+List all mounted filesystems with human-readable sizes:
+.B my_fs \-h
+.TP
+Check inode usage on the root filesystem:
+.B my_fs \-i /
+.TP
+Show dual-perspective Use% with reserved blocks (most informative on ext4):
+.B my_fs \-rh /
+.TP
+Analyze extents of a single file:
+.B my_fs \-f /etc/passwd
+.TP
+Scan fragmentation under a mount point:
+.B my_fs \-F /
+.TP
+Launch TUI in human-readable mode:
+.B my_fs \-sh
+.SH IMPLEMENTATION NOTES
+.IP \(bu 2
+Block size is taken from
+.I f_frsize
+(not
+.IR f_bsize )
+to avoid a 256x inflation bug on virtiofs mounts.
+.IP \(bu 2
+Use% formula: ceiling(used \[mu] 100 / (used + f_bavail)), matching GNU
+.BR df (1) .
+RUse% (\fB\-r\fR mode) uses ceiling(used \[mu] 100 / f_blocks), which includes
+the root-reserved area.
+.IP \(bu 2
+FIEMAP is not supported on overlayfs, virtiofs, tmpfs, procfs, and other
+pseudo-filesystems; these return an appropriate error.
+.SH SEE ALSO
+.BR df (1),
+.BR filefrag (1),
+.BR statfs (2),
+.BR ioctl_fiemap (2),
+.BR nftw (3)
+.SH AUTHOR
+YuC13600

@@ -12,6 +12,7 @@ RUN apt-get update && apt-get install -y \
     strace \
     # 2. 檔案系統健康檢測
     e2fsprogs \
+    xfsprogs \
     util-linux \
     smartmontools \
     # 3. 網路連線狀態監控
@@ -27,6 +28,12 @@ RUN apt-get update && apt-get install -y \
     dos2unix \
     && rm -rf /var/lib/apt/lists/*
 
+# 移除 Ubuntu minimal 的 man stub 與 dpkg-divert，讓 man-db 裝真正的 binary
+RUN dpkg-divert --remove /usr/bin/man && \
+    rm -f /usr/bin/man /etc/dpkg/dpkg.cfg.d/excludes && \
+    apt-get update && \
+    apt-get install -y --reinstall man-db && \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /home/project/busybox
 

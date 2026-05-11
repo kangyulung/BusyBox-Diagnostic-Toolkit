@@ -10,20 +10,23 @@
 //kbuild:lib-$(CONFIG_MY_FS) += diag_fs.o
 //kbuild:lib-$(CONFIG_MY_FS) += libdiag.o
 
-//usage:#define my_fs_trivial_usage "[-h] [-i] [-r] [-t TYPE] [-x TYPE] [-f FILE] [-F PATH] [PATH]..."
+//usage:#define my_fs_trivial_usage "[-h] [-i] [-r] [-t TYPE] [-x TYPE] [-f FILE] [-F PATH] [-s] [PATH]..."
 //usage:#define my_fs_full_usage "\n\n"
 //usage:       "Show filesystem disk space and inode usage\n"
 //usage:     "\n	-h		Human-readable sizes (K/M/G/T)"
 //usage:     "\n	-i		Show inode usage instead of block usage"
 //usage:     "\n	-r		Show dual Use% (user/real) and reserved blocks"
-//usage:     "\n	-t TYPE	Only show filesystems of TYPE"
-//usage:     "\n	-x TYPE	Exclude filesystems of TYPE"
-//usage:     "\n	-f FILE	Fragmentation analysis for FILE"
-//usage:     "\n	-F PATH	Fragmentation statistics for filesystem at PATH"
+//usage:     "\n	-t TYPE		Only show filesystems of TYPE"
+//usage:     "\n	-x TYPE		Exclude filesystems of TYPE"
+//usage:     "\n	-f FILE		Fragmentation analysis for FILE"
+//usage:     "\n	-F PATH		Fragmentation statistics for filesystem at PATH"
+//usage:     "\n	-s		Interactive TUI (D=disk I=inode R=reserved F=frag H=human Q=quit)"
 
 #include "libbb.h"
 #include "libdiag.h"
 #include <ftw.h>
+#include <termios.h>
+#include <ctype.h>
 
 /* 掛載點清單節點（解析自 /proc/mounts） */
 typedef struct mount_node {
@@ -579,11 +582,193 @@ static void print_frag_stat(const char *path)
     }
 }
 
+/* ── P5：互動式 TUI 模式（-s） ── */
+
+typedef enum {
+    FS_VIEW_DF,
+    FS_VIEW_INODE,
+    FS_VIEW_RESERVED,
+    FS_VIEW_FRAG,
+} fs_view_t;
+
+static fs_view_t     g_tui_view       = FS_VIEW_DF;
+static int           g_tui_human      = 0;
+static int           g_tui_frag_ready = 0;
+static struct l2_ctx g_tui_frag_cache;
+
+/* 收集所有有效掛載點的 fs_entry_t；*out 需呼叫 free() 釋放 */
+static int collect_all_entries(fs_entry_t **out)
+{
+    mount_node_t *mounts = get_mount_list();
+    dev_t         seen_dev[256];
+    mount_node_t *seen_node[256];
+    int           seen_n = 0, n = 0, i;
+    mount_node_t *m;
+
+    for (m = mounts; m; m = m->next) {
+        fs_entry_t tmp;
+        struct stat sb;
+        if (get_fs_entry(m->mountpoint, &tmp) != 0 || tmp.total_1k == 0)
+            continue;
+        if (stat(m->mountpoint, &sb) != 0)
+            continue;
+        int found = 0;
+        for (i = 0; i < seen_n; i++) {
+            if (seen_dev[i] == sb.st_dev) { seen_node[i] = m; found = 1; break; }
+        }
+        if (!found && seen_n < 256) {
+            seen_dev[seen_n]  = sb.st_dev;
+            seen_node[seen_n] = m;
+            seen_n++;
+        }
+    }
+
+    fs_entry_t *entries = xzalloc((seen_n ? seen_n : 1) * sizeof(fs_entry_t));
+    for (i = 0; i < seen_n; i++) {
+        if (get_fs_entry(seen_node[i]->mountpoint, &entries[n]) != 0) continue;
+        safe_strncpy(entries[n].device, seen_node[i]->device, sizeof(entries[n].device));
+        safe_strncpy(entries[n].fstype, seen_node[i]->fstype, sizeof(entries[n].fstype));
+        n++;
+    }
+    free_mount_list(mounts);
+    *out = entries;
+    return n;
+}
+
+static const char *tui_view_name(void)
+{
+    switch (g_tui_view) {
+    case FS_VIEW_DF:       return "Disk";
+    case FS_VIEW_INODE:    return "Inode";
+    case FS_VIEW_RESERVED: return "Reserved";
+    case FS_VIEW_FRAG:     return "Fragment";
+    default:               return "?";
+    }
+}
+
+static void tui_print_header(void)
+{
+    printf("\033[H\033[J");
+    printf(DIAG_CYAN "[MY_FS]" DIAG_RESET
+           " View: " DIAG_YELLOW "%s" DIAG_RESET
+           "  Human: %s"
+           DIAG_CLR_EOL "\n",
+           tui_view_name(),
+           g_tui_human ? (DIAG_GREEN "on" DIAG_RESET) : "off");
+    printf("D=disk  I=inode  R=reserved  F=frag(scan)  H=human  Q=quit"
+           DIAG_CLR_EOL "\n");
+    printf("------------------------------------------------------------"
+           DIAG_CLR_EOL "\n");
+}
+
+/* 對 / 執行 nftw 碎片統計，結果存入快取 */
+static void tui_do_frag_scan(void)
+{
+    printf("\033[H\033[J");
+    printf(DIAG_YELLOW "Scanning / for fragmentation, please wait..."
+           DIAG_RESET DIAG_CLR_EOL "\n");
+    fflush(stdout);
+    memset(&g_l2, 0, sizeof(g_l2));
+    nftw("/", l2_nftw_cb, 16, FTW_MOUNT | FTW_PHYS);
+    g_tui_frag_cache = g_l2;
+    g_tui_frag_ready = 1;
+}
+
+static void tui_print_frag_view(void)
+{
+    int i;
+    double pct;
+    struct l2_ctx *c = &g_tui_frag_cache;
+
+    if (!g_tui_frag_ready) {
+        printf("  (press F to start fragmentation scan on /)" DIAG_CLR_EOL "\n");
+        return;
+    }
+    pct = (c->total > 0) ? (double)c->frag * 100.0 / (double)c->total : 0.0;
+
+    printf("Scan path: /" DIAG_CLR_EOL "\n");
+    printf("Scanned: %llu files  Fragmented: %llu (%.1f%%)" DIAG_CLR_EOL "\n\n",
+           (unsigned long long)c->total,
+           (unsigned long long)c->frag, pct);
+    printf("Fragmentation distribution:" DIAG_CLR_EOL "\n");
+    printf("  %-10s  %s" DIAG_CLR_EOL "\n",   "Extents", "Files");
+    printf("  %-10s  %llu" DIAG_CLR_EOL "\n", "1",    (unsigned long long)c->dist[0]);
+    printf("  %-10s  %llu" DIAG_CLR_EOL "\n", "2-4",  (unsigned long long)c->dist[1]);
+    printf("  %-10s  %llu" DIAG_CLR_EOL "\n", "5-16", (unsigned long long)c->dist[2]);
+    printf("  %-10s  %llu" DIAG_CLR_EOL "\n", "17+",  (unsigned long long)c->dist[3]);
+
+    if (c->top_count > 0) {
+        qsort(c->top, c->top_count, sizeof(c->top[0]), cmp_top_entry);
+        printf("\nTop %d most fragmented:" DIAG_CLR_EOL "\n", c->top_count);
+        printf("  %7s  %s" DIAG_CLR_EOL "\n", "Extents", "File");
+        for (i = 0; i < c->top_count; i++)
+            printf("  %7u  %s" DIAG_CLR_EOL "\n",
+                   c->top[i].extents, c->top[i].path);
+    }
+    printf("\n  [cached - press F to re-scan]" DIAG_CLR_EOL "\n");
+}
+
+/* 非阻塞讀取一個按鍵（toupper 正規化後存入 *out），回傳 1 有輸入 / 0 無輸入 */
+static int tui_read_key(char *out)
+{
+    struct pollfd pfd = { STDIN_FILENO, POLLIN, 0 };
+    if (poll(&pfd, 1, 0) <= 0) return 0;
+    if (read(STDIN_FILENO, out, 1) <= 0) return 0;
+    *out = (char)toupper((unsigned char)*out);
+    return 1;
+}
+
+static void show_fs_tui(void)
+{
+    struct termios old_t;
+    struct pollfd  pfd = { STDIN_FILENO, POLLIN, 0 };
+
+    if (!isatty(STDOUT_FILENO))
+        bb_error_msg_and_die("-s requires a terminal");
+
+    diag_ui_mode_raw(&old_t);
+    printf(DIAG_HIDE);
+    fflush(stdout);
+
+    while (1) {
+        char c = 0;
+        tui_read_key(&c);
+
+        if      (c == 'Q') break;
+        else if (c == 'D') g_tui_view = FS_VIEW_DF;
+        else if (c == 'I') g_tui_view = FS_VIEW_INODE;
+        else if (c == 'R') g_tui_view = FS_VIEW_RESERVED;
+        else if (c == 'F') { g_tui_view = FS_VIEW_FRAG; tui_do_frag_scan(); }
+        else if (c == 'H') g_tui_human = !g_tui_human;
+
+        tui_print_header();
+        if (g_tui_view == FS_VIEW_FRAG) {
+            tui_print_frag_view();
+        } else {
+            fs_entry_t *entries = NULL;
+            int n = collect_all_entries(&entries);
+            print_entries(entries, n, g_tui_human,
+                          g_tui_view == FS_VIEW_INODE,
+                          g_tui_view == FS_VIEW_RESERVED);
+            free(entries);
+        }
+        fflush(stdout);
+
+        poll(&pfd, 1, 1000);
+    }
+
+    printf(DIAG_SHOW);
+    fflush(stdout);
+    diag_ui_mode_normal(&old_t);
+    printf("\n");
+    fflush(stdout);
+}
+
 int my_fs_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
 int my_fs_main(int argc, char **argv)
 {
     char    *opt_t = NULL, *opt_x = NULL, *opt_f = NULL, *opt_F = NULL;
-    unsigned opts     = getopt32(argv, "hirt:x:f:F:", &opt_t, &opt_x, &opt_f, &opt_F);
+    unsigned opts     = getopt32(argv, "hirt:x:f:F:s", &opt_t, &opt_x, &opt_f, &opt_F);
     int      human    = (opts & (1 << 0));
     int      inode    = (opts & (1 << 1));
     int      reserved = (opts & (1 << 2));
@@ -591,10 +776,12 @@ int my_fs_main(int argc, char **argv)
     int      has_x    = (opts & (1 << 4));
     int      has_f    = (opts & (1 << 5));
     int      has_F    = (opts & (1 << 6));
+    int      has_s    = (opts & (1 << 7));
     argv += optind;
 
     if (has_f) { print_file_frag(opt_f); return EXIT_SUCCESS; }
     if (has_F) { print_frag_stat(opt_F); return EXIT_SUCCESS; }
+    if (has_s) { g_tui_human = human; show_fs_tui(); return EXIT_SUCCESS; }
 
     mount_node_t *mounts = get_mount_list();
     fs_entry_t   *entries;

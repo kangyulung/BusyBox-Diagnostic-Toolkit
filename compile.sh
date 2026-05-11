@@ -8,7 +8,7 @@ rm -f my_diag/Config.in my_diag/Kbuild
 echo "Removing object files in my_diag..."
 #find my_diag -name "*.o" -type f -
 # 先確認清單
-find my_diag -type f ! -name "*.c" ! -name "*.src" ! -name "*.h" ! -name "*.md" ! -name "*.sh" -delete
+find my_diag -type f ! -name "*.c" ! -name "*.src" ! -name "*.h" ! -name "*.md" ! -name "*.sh" ! -name "*.1" -delete
 
 
 echo "Generating build files..."
