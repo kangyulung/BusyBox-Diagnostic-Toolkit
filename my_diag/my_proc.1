@@ -1,0 +1,125 @@
+.\" vi: set sw=4 ts=4:
+.TH MY_PROC 1 "2026-05-11" "BusyBox Diagnostic Toolkit" "User Commands"
+.SH NAME
+my_proc \- interactive process viewer and system resource analyzer
+.SH SYNOPSIS
+.B my_proc
+[\fIOPTION\fR]...
+.SH DESCRIPTION
+.B my_proc
+provides real-time system process monitoring with support for both list and
+hierarchical tree views. It displays CPU usage, memory consumption (RSS/VSZ),
+process states, and execution time, featuring dynamic sorting and an interactive
+user interface.
+.PP
+Core features:
+.IP \(bu 2
+Real-time Monitoring: Automatically refreshes process lists and CPU/Memory statistics.
+.IP \(bu 2
+Tree View: Builds a process tree based on PPID relationships to visualize parent-child hierarchies.
+.IP \(bu 2
+Multi-dimensional Sorting: Supports sorting by CPU, Memory, PID, User, State, and Command.
+.IP \(bu 2
+Interactive Operations: Dynamically switch views, change sort modes, or send signals to terminate processes during runtime.
+.IP \(bu 2
+Batch Mode: Supports non-interactive output, suitable for logging or scripting.
+.SH OPTIONS
+.TP
+.B \-t
+Tree view mode. Starts the application with the hierarchical process tree display.
+.TP
+\fB\-d\fR \fISECONDS\fR
+Delay time between updates. Default is 1.0 second.
+.TP
+\fB\-n\fR \fICOUNT\fR
+Number of iterations. Exit after updating the specified number of times.
+.TP
+\fB\-p\fR \fIPID\fR
+Monitor a specific PID. Only displays information related to the target process.
+.TP
+.B \-b
+Batch mode. Disables terminal control sequences and ignores keyboard input, ideal for redirection to files.
+.SH INTERACTIVE COMMANDS
+In non-batch mode, the following keys are supported:
+.TP
+.B T
+Toggle between List view (TOP) and Tree view (TREE).
+.TP
+.B Q
+Quit the program.
+.TP
+.B K
+Kill process. Prompts for a PID to send the SIGTERM signal.
+.TP
+.B Sorting Control
+Press any of the following characters to sort the list:
+.RS
+.IP \fBP\fR 8
+Sort by CPU usage percentage (Default)
+.IP \fBM\fR 8
+Sort by RSS (Resident Set Size)
+.IP \fBV\fR 8
+Sort by VSZ (Virtual Memory Size)
+.IP \fBI\fR 8
+Sort by PID (Process ID)
+.IP \fBO\fR 8
+Sort by PPID (Parent Process ID)
+.IP \fBU\fR 8
+Sort by USER (Username)
+.IP \fBS\fR 8
+Sort by STAT (Process State)
+.IP \fBC\fR 8
+Sort by COMMAND (Command name)
+.RE
+.SH COLUMNS
+.TP
+.B PID
+Process Identification number.
+.TP
+.B PPID
+Parent Process Identification number.
+.TP
+.B THR
+Number of threads.
+.TP
+.B USER
+Username of the process owner.
+.TP
+.B STAT
+Process state (R: Running, S: Sleeping, D: Uninterruptible sleep, Z: Zombie, T: Stopped).
+.TP
+.B NI
+Nice value (Scheduling priority).
+.TP
+.B VSZ
+Total virtual memory size.
+.TP
+.B RSS
+Resident Set Size (Physical memory currently used).
+.TP
+.B %CPU
+CPU usage percentage since the last update.
+.TP
+.B %MEM
+Physical memory usage percentage.
+.TP
+.B TIME
+Total CPU time consumed by the process.
+.TP
+.B COMMAND
+Command name .
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Failure or insufficient permissions.
+.SH SEE ALSO
+.BR top (1),
+.BR ps (1),
+.BR pstree (1),
+.BR kill (1),
+.BR proc (5)
+.SH AUTHOR
+kangyulung
