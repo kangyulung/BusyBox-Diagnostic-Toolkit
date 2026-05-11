@@ -255,7 +255,7 @@ static void display_list(proc_node_t *list, proc_node_t **sorted_arr, int cnt) {
         proc_node_t *cn = sorted_arr[i];
         const char *user = uid2uname(cn->pinfo->uid);
         printf("%-6d %-6d %-4d %-10.10s %-4c %-4d %-10s %-10s %-6.1f %-6.1f %-8s %-*.*s%s\n",
-               cn->pinfo->pid, cn->pinfo->ppid, 0, user,
+               cn->pinfo->pid, cn->pinfo->ppid, cn->pinfo->sid, user,
                cn->pinfo->state[0], cn->pinfo->niceness, 
                make_human_readable_str(cn->pinfo->vsz * 1024ULL, 1, 0), 
                make_human_readable_str(cn->pinfo->rss * 1024ULL, 1, 0), 
@@ -328,7 +328,6 @@ static void show_top_with_cpu(void) {
 
     if (!G.batch_mode) {
         diag_ui_mode_normal(&old_t);
-        // 退出時清空最後一行提示並確保游標換行，避免干擾 Shell 提示字元
         printf("\n");
         fflush(stdout);
     }
@@ -351,9 +350,8 @@ int my_proc_main(int argc, char **argv)
     if (opts & 4) G.iterations = iterations;
     if (opts & 8) G.target_pid = pid;
     if (opts & 16) G.batch_mode = true;
-    if (opts & 1) G.view_mode = VIEW_TREE; // 如果有 -t，預設進入樹狀模式
+    if (opts & 1) G.view_mode = VIEW_TREE;
 
-    // 移除原本在這裡直接 return 的邏輯，讓所有模式都進入主循環
     show_top_with_cpu();
     return EXIT_SUCCESS;
 }

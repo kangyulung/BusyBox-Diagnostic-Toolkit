@@ -24,22 +24,6 @@ typedef struct diag_node_base {
     struct diag_node_base *next;    /* 線性鏈表指標，用於遍歷所有節點 */
 } diag_node_base_t;
 
-/* 行程資訊結構 (解析自 /proc/[pid]/stat 與 status) */
-typedef struct {
-    int pid;
-    int ppid;
-    unsigned int uid;
-    char state;                     /* 行程狀態 (R, S, D, Z, T) */
-    char comm[64];                  /* 執行指令名稱 */
-    unsigned long vmsize;           /* 虛擬記憶體大小 (bytes) */
-    unsigned long rss;              /* 常駐記憶體大小 (bytes) */
-    unsigned long utime;            /* 用戶態 CPU 時間 (jiffies) */
-    unsigned long stime;            /* 核心態 CPU 時間 (jiffies) */
-    int threads;                    /* 執行緒數量 */
-    int priority;                   /* 核心優先權 */
-    int nice;                       /* Nice 值 (-20 ~ 19) */
-    unsigned long long start_time;  /* 系統啟動後的開機秒數 (jiffies) */
-} diag_proc_t;
 
 /* 檔案系統資訊結構 (統計磁碟使用狀況) */
 typedef struct {
