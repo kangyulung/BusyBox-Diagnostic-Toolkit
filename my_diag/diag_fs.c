@@ -25,6 +25,7 @@
 #include "libbb.h"
 #include "libdiag.h"
 #include <ftw.h>
+#include <mntent.h>
 #include <termios.h>
 #include <ctype.h>
 
@@ -56,32 +57,28 @@ typedef struct {
     unsigned      use_pct_real;  /* ceiling(used_real / total * 100)，含保留區 */
 } fs_entry_t;
 
-/* 解析 /proc/mounts，回傳掛載點清單（linked list，順序與檔案相同） */
+/* 解析掛載表，回傳掛載點清單（linked list，順序與檔案相同）。
+ * 使用 setmntent/getmntent 正確處理路徑中的 octal 逸脫（\040 → 空格等）。
+ * bb_path_mtab_file 依 BusyBox 編譯設定自動選 /etc/mtab 或 /proc/mounts。 */
 static mount_node_t *get_mount_list(void)
 {
-    char *buf = xmalloc_open_read_close("/proc/mounts", NULL);
-    if (!buf) return NULL;
+    FILE          *fp;
+    struct mntent *entry;
+    mount_node_t  *head = NULL, *tail = NULL;
 
-    mount_node_t *head = NULL, *tail = NULL;
-    char *line = buf;
+    fp = setmntent(bb_path_mtab_file, "r");
+    if (!fp) return NULL;
 
-    while (line && *line) {
-        char *eol = strchr(line, '\n');
-        if (eol) *eol = '\0';
-
-        char dev[PATH_MAX], mp[PATH_MAX], fst[64];
-        if (sscanf(line, "%s %s %s", dev, mp, fst) == 3) {
-            mount_node_t *node = xzalloc(sizeof(mount_node_t));
-            safe_strncpy(node->device,     dev, sizeof(node->device));
-            safe_strncpy(node->mountpoint, mp,  sizeof(node->mountpoint));
-            safe_strncpy(node->fstype,     fst, sizeof(node->fstype));
-            if (!head) head = node;
-            else       tail->next = node;
-            tail = node;
-        }
-        line = eol ? eol + 1 : NULL;
+    while ((entry = getmntent(fp)) != NULL) {
+        mount_node_t *node = xzalloc(sizeof(mount_node_t));
+        safe_strncpy(node->device,     entry->mnt_fsname, sizeof(node->device));
+        safe_strncpy(node->mountpoint, entry->mnt_dir,    sizeof(node->mountpoint));
+        safe_strncpy(node->fstype,     entry->mnt_type,   sizeof(node->fstype));
+        if (!head) head = node;
+        else       tail->next = node;
+        tail = node;
     }
-    free(buf);
+    endmntent(fp);
     return head;
 }
 
@@ -165,14 +162,15 @@ static char *fmt_human(uint64_t kb, char *buf, size_t buflen)
         u++;
     }
     if (val < 10.0) {
-        /* round-half-up（對齊 df 行為，避免 C printf 的 round-half-to-even） */
-        int t = (int)(val * 10.0 + 0.5);
+        /* ceiling（與 val>=10 分支一致，對齊 GNU df -h 行為） */
+        int t = (int)(val * 10.0);
+        if ((double)t < val * 10.0) t++;
         if (t >= 100)
             snprintf(buf, buflen, "%d%c", t / 10, units[u]);
         else
             snprintf(buf, buflen, "%d.%d%c", t / 10, t % 10, units[u]);
     } else {
-        /* ceiling（對齊 df 行為） */
+        /* ceiling */
         uint64_t c = (uint64_t)val;
         if ((double)c < val) c++;
         snprintf(buf, buflen, "%llu%c", (unsigned long long)c, units[u]);
@@ -195,7 +193,9 @@ static char *fmt_human_count(uint64_t n, char *buf, size_t buflen)
     if (u < 0) {
         snprintf(buf, buflen, "%llu", (unsigned long long)n);
     } else if (val < 10.0) {
-        int t = (int)(val * 10.0 + 0.5);
+        /* ceiling（與 val>=10 分支一致，對齊 GNU df -h 行為） */
+        int t = (int)(val * 10.0);
+        if ((double)t < val * 10.0) t++;
         if (t >= 100)
             snprintf(buf, buflen, "%d%c", t / 10, units[u]);
         else
@@ -712,7 +712,7 @@ static void tui_print_frag_view(void)
 static int tui_read_key(char *out)
 {
     struct pollfd pfd = { STDIN_FILENO, POLLIN, 0 };
-    if (poll(&pfd, 1, 0) <= 0) return 0;
+    if (safe_poll(&pfd, 1, 0) <= 0) return 0;
     if (read(STDIN_FILENO, out, 1) <= 0) return 0;
     *out = (char)toupper((unsigned char)*out);
     return 1;
@@ -754,7 +754,7 @@ static void show_fs_tui(void)
         }
         fflush(stdout);
 
-        poll(&pfd, 1, 1000);
+        safe_poll(&pfd, 1, 1000);
     }
 
     printf(DIAG_SHOW);
