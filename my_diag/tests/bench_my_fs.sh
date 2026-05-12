@@ -8,7 +8,7 @@
 # Output: Markdown table to stdout (redirect to a .md file if desired).
 
 BUSYBOX="${1:-./busybox}"
-REPEAT=10        # number of runs per case for averaging
+REPEAT=100       # number of runs per case for averaging (100 keeps loop time >50 ms, well above bash time resolution)
 TMPDIR_WORK=$(mktemp -d)
 LOOP_DEV=""
 LOOP_MNT=""
@@ -131,12 +131,3 @@ else
     losetup -d "$LOOP_DEV"
     LOOP_DEV=""; LOOP_MNT=""
 fi
-
-echo ""
-echo "## Analysis"
-echo ""
-echo "- Disk usage cases measure \`statfs(2)\` + output formatting overhead."
-echo "- Fragmentation cases measure \`ioctl(FIEMAP)\` + extent parsing."
-echo "- A ratio > 1.50 indicates my_fs exceeds the 50% overhead target."
-echo "- Expected overhead sources: BusyBox startup, /proc/mounts parsing,"
-echo "  and st_dev deduplication loop not present in GNU df."
