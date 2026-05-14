@@ -25,22 +25,26 @@
 #include "libbb.h"
 #include "libdiag.h"
 #include <ftw.h>
+#include <mntent.h>
 #include <termios.h>
 #include <ctype.h>
 
-/* 掛載點清單節點（解析自 /proc/mounts） */
+/* 掛載點清單節點（解析自 /proc/mounts）。
+ * 三個字串為 xstrdup 配置，由 free_mount_list 釋放；
+ * 避免 PATH_MAX 固定陣列導致每節點浪費 ~8 KB 清零成本。 */
 typedef struct mount_node {
-    char              device[PATH_MAX];
-    char              mountpoint[PATH_MAX];
-    char              fstype[64];
+    char              *device;
+    char              *mountpoint;
+    char              *fstype;
     struct mount_node *next;
 } mount_node_t;
 
-/* 單一掛載點的展示用欄位，由 get_fs_entry() 計算填入 */
+/* 單一掛載點的展示用欄位，由 get_fs_entry() 計算填入。
+ * 三個字串為 xstrdup 配置，需呼叫 free_fs_entry() 釋放。 */
 typedef struct {
-    char          device[PATH_MAX];
-    char          path[PATH_MAX];
-    char          fstype[64];
+    char          *device;
+    char          *path;
+    char          *fstype;
     /* 容量欄位（預設模式） */
     uint64_t      total_1k;
     uint64_t      used_1k;
@@ -56,32 +60,36 @@ typedef struct {
     unsigned      use_pct_real;  /* ceiling(used_real / total * 100)，含保留區 */
 } fs_entry_t;
 
-/* 解析 /proc/mounts，回傳掛載點清單（linked list，順序與檔案相同） */
+static void free_fs_entry(fs_entry_t *e)
+{
+    if (!e) return;
+    free(e->device); e->device = NULL;
+    free(e->path);   e->path   = NULL;
+    free(e->fstype); e->fstype = NULL;
+}
+
+/* 解析掛載表，回傳掛載點清單（linked list，順序與檔案相同）。
+ * 使用 setmntent/getmntent 正確處理路徑中的 octal 逸脫（\040 → 空格等）。
+ * bb_path_mtab_file 依 BusyBox 編譯設定自動選 /etc/mtab 或 /proc/mounts。 */
 static mount_node_t *get_mount_list(void)
 {
-    char *buf = xmalloc_open_read_close("/proc/mounts", NULL);
-    if (!buf) return NULL;
+    FILE          *fp;
+    struct mntent *entry;
+    mount_node_t  *head = NULL, *tail = NULL;
 
-    mount_node_t *head = NULL, *tail = NULL;
-    char *line = buf;
+    fp = setmntent(bb_path_mtab_file, "r");
+    if (!fp) return NULL;
 
-    while (line && *line) {
-        char *eol = strchr(line, '\n');
-        if (eol) *eol = '\0';
-
-        char dev[PATH_MAX], mp[PATH_MAX], fst[64];
-        if (sscanf(line, "%s %s %s", dev, mp, fst) == 3) {
-            mount_node_t *node = xzalloc(sizeof(mount_node_t));
-            safe_strncpy(node->device,     dev, sizeof(node->device));
-            safe_strncpy(node->mountpoint, mp,  sizeof(node->mountpoint));
-            safe_strncpy(node->fstype,     fst, sizeof(node->fstype));
-            if (!head) head = node;
-            else       tail->next = node;
-            tail = node;
-        }
-        line = eol ? eol + 1 : NULL;
+    while ((entry = getmntent(fp)) != NULL) {
+        mount_node_t *node = xzalloc(sizeof(mount_node_t));
+        node->device     = xstrdup(entry->mnt_fsname);
+        node->mountpoint = xstrdup(entry->mnt_dir);
+        node->fstype     = xstrdup(entry->mnt_type);
+        if (!head) head = node;
+        else       tail->next = node;
+        tail = node;
     }
-    free(buf);
+    endmntent(fp);
     return head;
 }
 
@@ -89,6 +97,9 @@ static void free_mount_list(mount_node_t *head)
 {
     while (head) {
         mount_node_t *next = head->next;
+        free(head->device);
+        free(head->mountpoint);
+        free(head->fstype);
         free(head);
         head = next;
     }
@@ -106,7 +117,7 @@ static int get_fs_entry(const char *path, fs_entry_t *e)
     uint64_t avail    = fs.free_bytes;
     uint64_t nonr_tot = used + avail;
 
-    safe_strncpy(e->path, path, sizeof(e->path));
+    e->path = xstrdup(path);
     e->total_1k = fs.total_bytes / 1024;
     e->used_1k  = used / 1024;
     e->avail_1k = avail / 1024;
@@ -165,14 +176,15 @@ static char *fmt_human(uint64_t kb, char *buf, size_t buflen)
         u++;
     }
     if (val < 10.0) {
-        /* round-half-up（對齊 df 行為，避免 C printf 的 round-half-to-even） */
-        int t = (int)(val * 10.0 + 0.5);
+        /* ceiling（與 val>=10 分支一致，對齊 GNU df -h 行為） */
+        int t = (int)(val * 10.0);
+        if ((double)t < val * 10.0) t++;
         if (t >= 100)
             snprintf(buf, buflen, "%d%c", t / 10, units[u]);
         else
             snprintf(buf, buflen, "%d.%d%c", t / 10, t % 10, units[u]);
     } else {
-        /* ceiling（對齊 df 行為） */
+        /* ceiling */
         uint64_t c = (uint64_t)val;
         if ((double)c < val) c++;
         snprintf(buf, buflen, "%llu%c", (unsigned long long)c, units[u]);
@@ -195,7 +207,9 @@ static char *fmt_human_count(uint64_t n, char *buf, size_t buflen)
     if (u < 0) {
         snprintf(buf, buflen, "%llu", (unsigned long long)n);
     } else if (val < 10.0) {
-        int t = (int)(val * 10.0 + 0.5);
+        /* ceiling（與 val>=10 分支一致，對齊 GNU df -h 行為） */
+        int t = (int)(val * 10.0);
+        if ((double)t < val * 10.0) t++;
         if (t >= 100)
             snprintf(buf, buflen, "%d%c", t / 10, units[u]);
         else
@@ -426,7 +440,6 @@ static void print_entries(const fs_entry_t *e, int n, int human, int inode, int 
 static void print_file_frag(const char *path)
 {
     diag_frag_t f;
-    struct statfs sfs;
     uint64_t blk_size, blocks, expected_phy;
     uint32_t i;
 
@@ -435,8 +448,8 @@ static void print_file_frag(const char *path)
         return;
     }
 
-    /* f_bsize：filesystem 宣告的 block size，filefrag 用此欄位換算 */
-    blk_size = (statfs(path, &sfs) == 0 && sfs.f_bsize > 0) ? (uint64_t)sfs.f_bsize : 4096;
+    /* block_size 由 libdiag 從 fstat.st_blksize 帶出，免再呼叫 statfs */
+    blk_size = f.block_size > 0 ? (uint64_t)f.block_size : 4096;
     blocks   = (f.file_size + blk_size - 1) / blk_size;
 
     printf("File size of %s is %llu (%llu block%s of %llu bytes)\n",
@@ -596,10 +609,25 @@ static int           g_tui_human      = 0;
 static int           g_tui_frag_ready = 0;
 static struct l2_ctx g_tui_frag_cache;
 
-/* 收集所有有效掛載點的 fs_entry_t；*out 需呼叫 free() 釋放 */
-static int collect_all_entries(fs_entry_t **out)
+/* 掛載表快取：TTL 內重複使用同一份清單，避免每秒重讀 /proc/mounts */
+#define MOUNT_CACHE_TTL 10
+static mount_node_t *g_tui_mount_cache    = NULL;
+static time_t        g_tui_mount_cache_ts = 0;
+
+static void tui_refresh_mount_cache(void)
 {
-    mount_node_t *mounts = get_mount_list();
+    time_t now = time(NULL);
+    if (g_tui_mount_cache && (now - g_tui_mount_cache_ts) < MOUNT_CACHE_TTL)
+        return;
+    free_mount_list(g_tui_mount_cache);
+    g_tui_mount_cache    = get_mount_list();
+    g_tui_mount_cache_ts = now;
+}
+
+/* 收集所有有效掛載點的 fs_entry_t；*out 需呼叫 free() 釋放。
+ * mounts 的生命週期由呼叫端管理，此函式不釋放它。 */
+static int collect_all_entries(mount_node_t *mounts, fs_entry_t **out)
+{
     dev_t         seen_dev[256];
     mount_node_t *seen_node[256];
     int           seen_n = 0, n = 0, i;
@@ -608,10 +636,15 @@ static int collect_all_entries(fs_entry_t **out)
     for (m = mounts; m; m = m->next) {
         fs_entry_t tmp;
         struct stat sb;
-        if (get_fs_entry(m->mountpoint, &tmp) != 0 || tmp.total_1k == 0)
+        memset(&tmp, 0, sizeof(tmp));
+        if (get_fs_entry(m->mountpoint, &tmp) != 0 || tmp.total_1k == 0) {
+            free_fs_entry(&tmp);
             continue;
-        if (stat(m->mountpoint, &sb) != 0)
+        }
+        if (stat(m->mountpoint, &sb) != 0) {
+            free_fs_entry(&tmp);
             continue;
+        }
         int found = 0;
         for (i = 0; i < seen_n; i++) {
             if (seen_dev[i] == sb.st_dev) { seen_node[i] = m; found = 1; break; }
@@ -621,16 +654,16 @@ static int collect_all_entries(fs_entry_t **out)
             seen_node[seen_n] = m;
             seen_n++;
         }
+        free_fs_entry(&tmp);
     }
 
     fs_entry_t *entries = xzalloc((seen_n ? seen_n : 1) * sizeof(fs_entry_t));
     for (i = 0; i < seen_n; i++) {
         if (get_fs_entry(seen_node[i]->mountpoint, &entries[n]) != 0) continue;
-        safe_strncpy(entries[n].device, seen_node[i]->device, sizeof(entries[n].device));
-        safe_strncpy(entries[n].fstype, seen_node[i]->fstype, sizeof(entries[n].fstype));
+        entries[n].device = xstrdup(seen_node[i]->device);
+        entries[n].fstype = xstrdup(seen_node[i]->fstype);
         n++;
     }
-    free_mount_list(mounts);
     *out = entries;
     return n;
 }
@@ -712,7 +745,7 @@ static void tui_print_frag_view(void)
 static int tui_read_key(char *out)
 {
     struct pollfd pfd = { STDIN_FILENO, POLLIN, 0 };
-    if (poll(&pfd, 1, 0) <= 0) return 0;
+    if (safe_poll(&pfd, 1, 0) <= 0) return 0;
     if (read(STDIN_FILENO, out, 1) <= 0) return 0;
     *out = (char)toupper((unsigned char)*out);
     return 1;
@@ -745,17 +778,23 @@ static void show_fs_tui(void)
         if (g_tui_view == FS_VIEW_FRAG) {
             tui_print_frag_view();
         } else {
+            tui_refresh_mount_cache();
             fs_entry_t *entries = NULL;
-            int n = collect_all_entries(&entries);
+            int i, n = collect_all_entries(g_tui_mount_cache, &entries);
             print_entries(entries, n, g_tui_human,
                           g_tui_view == FS_VIEW_INODE,
                           g_tui_view == FS_VIEW_RESERVED);
+            for (i = 0; i < n; i++)
+                free_fs_entry(&entries[i]);
             free(entries);
         }
         fflush(stdout);
 
-        poll(&pfd, 1, 1000);
+        safe_poll(&pfd, 1, 1000);
     }
+
+    free_mount_list(g_tui_mount_cache);
+    g_tui_mount_cache = NULL;
 
     printf(DIAG_SHOW);
     fflush(stdout);
@@ -788,45 +827,62 @@ int my_fs_main(int argc, char **argv)
     int           n = 0, i;
 
     if (!argv[0]) {
-        dev_t        seen_dev[256];
+        dev_t         seen_dev[256];
         mount_node_t *seen_node[256];
-        int          seen_n = 0;
+        /* 先計算掛載點數量，按實際大小分配（避免 256 × ~8 KB 固定清零） */
+        int           mount_count = 0;
         mount_node_t *m;
+        for (m = mounts; m; m = m->next) mount_count++;
+        fs_entry_t   *seen_entry = xzalloc((mount_count ? mount_count : 1) * sizeof(fs_entry_t));
+        int           seen_n = 0;
 
-        /* 第一遍：過濾虛擬 fs 與 -t/-x 類型，以 st_dev 去重，保留每裝置最後出現的掛載點 */
+        /* 第一遍：先以 -t/-x 類型過濾，再呼叫 statfs()，
+         * 同時將結果暫存於 seen_entry，消除第二遍重複呼叫 statfs() */
         for (m = mounts; m; m = m->next) {
-            fs_entry_t tmp;
-            if (get_fs_entry(m->mountpoint, &tmp) != 0 || tmp.total_1k == 0)
-                continue;
+            fs_entry_t  tmp;
+            struct stat sb;
+            memset(&tmp, 0, sizeof(tmp));
             if (has_t && strcmp(m->fstype, opt_t) != 0) continue;
             if (has_x && strcmp(m->fstype, opt_x) == 0) continue;
-            struct stat sb;
-            if (stat(m->mountpoint, &sb) != 0)
+            if (get_fs_entry(m->mountpoint, &tmp) != 0 || tmp.total_1k == 0) {
+                free_fs_entry(&tmp);
                 continue;
+            }
+            if (stat(m->mountpoint, &sb) != 0) {
+                free_fs_entry(&tmp);
+                continue;
+            }
             int found = 0;
             for (i = 0; i < seen_n; i++) {
                 if (seen_dev[i] == sb.st_dev) {
-                    seen_node[i] = m;
+                    seen_node[i]  = m;
+                    /* 同裝置 bind mount：先釋放舊條目的字串，再轉移 tmp 的擁有權 */
+                    free_fs_entry(&seen_entry[i]);
+                    seen_entry[i] = tmp;
                     found = 1;
                     break;
                 }
             }
             if (!found && seen_n < 256) {
-                seen_dev[seen_n]  = sb.st_dev;
-                seen_node[seen_n] = m;
+                seen_dev[seen_n]   = sb.st_dev;
+                seen_node[seen_n]  = m;
+                seen_entry[seen_n] = tmp;   /* 轉移擁有權 */
                 seen_n++;
+            } else if (!found) {
+                /* 超過 256 個唯一掛載點，丟棄 tmp */
+                free_fs_entry(&tmp);
             }
         }
 
-        /* 第二遍：收集 fs_entry_t 到陣列，供 print_entries 計算動態欄寬 */
+        /* 第二遍：轉移 seen_entry 擁有權至 entries，並補上 device/fstype */
         entries = xzalloc((seen_n ? seen_n : 1) * sizeof(fs_entry_t));
         for (i = 0; i < seen_n; i++) {
-            if (get_fs_entry(seen_node[i]->mountpoint, &entries[n]) != 0)
-                continue;
-            safe_strncpy(entries[n].device, seen_node[i]->device, sizeof(entries[n].device));
-            safe_strncpy(entries[n].fstype, seen_node[i]->fstype, sizeof(entries[n].fstype));
+            entries[n] = seen_entry[i];                  /* shallow copy（轉移字串擁有權） */
+            entries[n].device = xstrdup(seen_node[i]->device);
+            entries[n].fstype = xstrdup(seen_node[i]->fstype);
             n++;
         }
+        free(seen_entry);   /* 字串擁有權已轉移至 entries，只釋放陣列 */
     } else {
         /* 有參數：對每個路徑收集 fs_entry_t */
         char **arg;
@@ -850,18 +906,23 @@ int my_fs_main(int argc, char **argv)
                 }
             }
             if (best) {
-                if (has_t && strcmp(best->fstype, opt_t) != 0) continue;
-                if (has_x && strcmp(best->fstype, opt_x) == 0) continue;
-                safe_strncpy(entries[n].device, best->device, sizeof(entries[n].device));
-                safe_strncpy(entries[n].fstype, best->fstype, sizeof(entries[n].fstype));
+                if ((has_t && strcmp(best->fstype, opt_t) != 0)
+                 || (has_x && strcmp(best->fstype, opt_x) == 0)) {
+                    free_fs_entry(&entries[n]);   /* 過濾掉時釋放已配置的 path */
+                    continue;
+                }
+                entries[n].device = xstrdup(best->device);
+                entries[n].fstype = xstrdup(best->fstype);
             } else {
-                safe_strncpy(entries[n].device, *arg, sizeof(entries[n].device));
+                entries[n].device = xstrdup(*arg);
             }
             n++;
         }
     }
 
     print_entries(entries, n, human, inode, reserved);
+    for (i = 0; i < n; i++)
+        free_fs_entry(&entries[i]);
     free(entries);
     free_mount_list(mounts);
     return EXIT_SUCCESS;

@@ -85,6 +85,9 @@ const char* diag_get_tcp_state(int state) {
 
 /* --- 檔案碎片分析（服務 diag_fs）--- */
 
+/* 一次 ioctl 能容納的 extent 數量上限；涵蓋絕大多數真實檔案 */
+#define FIEMAP_INIT_COUNT  512
+
 int diag_read_fragmentation(const char *path, diag_frag_t *f, int collect_extents)
 {
     struct stat sb;
@@ -99,43 +102,83 @@ int diag_read_fragmentation(const char *path, diag_frag_t *f, int collect_extent
 
     if (fstat(fd, &sb) != 0) { close(fd); return -1; }
     if (!S_ISREG(sb.st_mode)) { close(fd); errno = EINVAL; return -1; }
-    f->file_size = (uint64_t)sb.st_size;
+    f->file_size  = (uint64_t)sb.st_size;
+    f->block_size = (uint32_t)sb.st_blksize;
 
-    /* 第一次呼叫：fm_extent_count=0 → 核心只回傳 fm_mapped_extents（extent 總數），不複製陣列 */
-    fm = xzalloc(sizeof(*fm));
+    if (!collect_extents) {
+        /* count-only 路徑（-F 目錄掃描）：fm_extent_count=0 讓核心只回傳總數 */
+        fm = xzalloc(sizeof(*fm));
+        fm->fm_start        = 0;
+        fm->fm_length       = FIEMAP_MAX_OFFSET;
+        fm->fm_flags        = 0;
+        fm->fm_extent_count = 0;
+        if (ioctl(fd, FS_IOC_FIEMAP, fm) != 0) {
+            free(fm);
+            close(fd);
+            return -1;
+        }
+        f->extent_count = fm->fm_mapped_extents;
+        free(fm);
+        close(fd);
+        return 0;
+    }
+
+    /* collect_extents=1（-f 單檔）：先用大 buffer 嘗試單次 ioctl。
+     * 若最後一個 extent 帶有 FIEMAP_EXTENT_LAST，代表全部取回；
+     * 否則 buffer 不足，退回 count-only + 精確大小的第二次呼叫。 */
+    size_t sz = sizeof(*fm) + sizeof(struct fiemap_extent) * FIEMAP_INIT_COUNT;
+    fm = xzalloc(sz);
     fm->fm_start        = 0;
     fm->fm_length       = FIEMAP_MAX_OFFSET;
     fm->fm_flags        = 0;
-    fm->fm_extent_count = 0;
+    fm->fm_extent_count = FIEMAP_INIT_COUNT;
 
     if (ioctl(fd, FS_IOC_FIEMAP, fm) != 0) {
         free(fm);
         close(fd);
         return -1;
     }
-    f->extent_count = fm->fm_mapped_extents;
 
-    if (collect_extents && f->extent_count > 0) {
-        /* 第二次呼叫：配置足夠大的緩衝區取回所有 extent 詳細資料 */
-        size_t sz = sizeof(*fm) + sizeof(struct fiemap_extent) * f->extent_count;
+    /* 判斷是否已取得全部 extent */
+    int all_done = (fm->fm_mapped_extents == 0) ||
+        (fm->fm_extents[fm->fm_mapped_extents - 1].fe_flags & FIEMAP_EXTENT_LAST);
+
+    if (!all_done) {
+        /* fallback：extent 數超過 FIEMAP_INIT_COUNT，用兩次呼叫取完 */
+        uint32_t total;
         free(fm);
-        fm = xzalloc(sz);
+        fm = xzalloc(sizeof(*fm));
         fm->fm_start        = 0;
         fm->fm_length       = FIEMAP_MAX_OFFSET;
         fm->fm_flags        = 0;
-        fm->fm_extent_count = f->extent_count;
-
+        fm->fm_extent_count = 0;
         if (ioctl(fd, FS_IOC_FIEMAP, fm) != 0) {
             free(fm);
             close(fd);
             return -1;
         }
-        f->extents = xmalloc(sizeof(struct fiemap_extent) * fm->fm_mapped_extents);
-        memcpy(f->extents, fm->fm_extents,
-               sizeof(struct fiemap_extent) * fm->fm_mapped_extents);
-        f->extent_count = fm->fm_mapped_extents;
+        total = fm->fm_mapped_extents;
+        free(fm);
+
+        sz = sizeof(*fm) + sizeof(struct fiemap_extent) * total;
+        fm = xzalloc(sz);
+        fm->fm_start        = 0;
+        fm->fm_length       = FIEMAP_MAX_OFFSET;
+        fm->fm_flags        = 0;
+        fm->fm_extent_count = total;
+        if (ioctl(fd, FS_IOC_FIEMAP, fm) != 0) {
+            free(fm);
+            close(fd);
+            return -1;
+        }
     }
 
+    f->extent_count = fm->fm_mapped_extents;
+    if (f->extent_count > 0) {
+        f->extents = xmalloc(sizeof(struct fiemap_extent) * f->extent_count);
+        memcpy(f->extents, fm->fm_extents,
+               sizeof(struct fiemap_extent) * f->extent_count);
+    }
     free(fm);
     close(fd);
     return 0;
