@@ -1,0 +1,394 @@
+.\" vi: set sw=4 ts=4:
+.TH MY_NET 1 "2026-05-15" "BusyBox Diagnostic Toolkit" "User Commands"
+.SH NAME
+my_net \- network connection monitor: socket listing, TCP state tracking, and anomaly detection
+.SH SYNOPSIS
+.B my_net
+[\fB\-t\fR]
+[\fB\-u\fR]
+[\fB\-a\fR]
+[\fB\-l\fR]
+[\fB\-n\fR]
+[\fB\-p\fR]
+[\fB\-b\fR]
+[\fB\-s\fR \fISTATE\fR]
+[\fB\-w\fR \fISEC\fR]
+.SH DESCRIPTION
+.B my_net
+displays TCP and UDP socket information by reading the kernel's procfs
+interfaces
+.IR /proc/net/tcp ,
+.IR /proc/net/tcp6 ,
+.IR /proc/net/udp ,
+and
+.IR /proc/net/udp6 .
+.PP
+In addition to basic socket listing, it provides:
+.IP \(bu 2
+TCP state machine tracking \(em each connection's state is decoded from the
+kernel's hex representation into a human-readable name (ESTABLISHED,
+TIME_WAIT, LISTEN, \&...).
+.IP \(bu 2
+Connection anomaly detection \(em after each scan,
+.B my_net
+checks state counts against empirically derived thresholds and prints a
+warning block when a potential problem is detected (SYN flood, connection
+leak, excessive TIME_WAIT, etc.).
+.IP \(bu 2
+PID and program name resolution \(em with
+.BR \-p ,
+.B my_net
+walks
+.I /proc/<pid>/fd/
+symlinks to map socket inodes to the owning process, then performs a
+sorted binary search for O(log n) lookup.
+.IP \(bu 2
+Watch mode \(em periodic live refresh suitable for real-time monitoring on
+a terminal, compatible with the
+.B \-b
+batch flag for script use.
+.PP
+The output format is broadly compatible with
+.BR ss (8)
+and
+.BR netstat (8)
+for easy drop-in comparison.
+.SH OPTIONS
+.TP
+.B \-t
+Show TCP sockets only.
+This is the default when neither
+.B \-u
+nor
+.B \-a
+is given.
+.TP
+.B \-u
+Show UDP sockets only.
+Suppresses TCP output; the State column shows
+.B \-
+for all UDP entries since UDP is stateless.
+.TP
+.B \-a
+Show all sockets (TCP and UDP).
+Equivalent to combining
+.B \-t
+and
+.BR \-u .
+.TP
+.B \-l
+Show only listening sockets.
+Filters to connections whose TCP state is
+.B LISTEN
+(state code 0x0A); UDP sockets are excluded.
+Compatible with
+.BR "ss \-l" .
+.TP
+.B \-n
+Numeric mode.
+Reserved for future hostname resolution suppression.
+Currently all addresses are printed in numeric form
+.RI ( addr : port )
+regardless of this flag, since
+.B my_net
+reads directly from procfs rather than invoking
+.BR getaddrinfo (3).
+.TP
+.B \-p
+Show PID and program name.
+.B my_net
+scans
+.I /proc/<pid>/fd/
+for each running process to build an inode\(->PID map.
+Non-root users can only resolve sockets owned by their own processes;
+unresolvable entries display
+.BR \- .
+Running as root reveals the owner of every socket.
+.TP
+.B \-b
+Batch mode.
+Disables all ANSI colour sequences and TUI control codes.
+Output is plain text suitable for
+.BR grep (1),
+.BR awk (1),
+or log redirection.
+.B my_net
+also enters batch mode automatically when stdout is not a terminal (pipe,
+file redirect, etc.).
+.TP
+\fB\-s\fR \fISTATE\fR
+Filter connections by TCP state name.
+The match is case-insensitive, so
+.B LISTEN
+and
+.B listen
+are equivalent.
+See the
+.B TCP STATES
+section for valid values.
+This option may be combined with
+.B \-l
+(though
+.B \-l
+alone is faster).
+.TP
+\fB\-w\fR \fISEC\fR
+Watch mode: clear the screen and re-run the scan every
+.I SEC
+seconds.
+.I SEC
+is clamped to a minimum of 1.
+If
+.I SEC
+is omitted or invalid, the default interval is 2 seconds.
+Press
+.B Q
+(or
+.BR q )
+to quit and restore the terminal.
+Requires a terminal on stdout; combine with
+.B \-b
+to get periodic plain-text output suitable for a script (the screen is
+not cleared in that case).
+.SH OUTPUT COLUMNS
+.TP
+.B Proto
+Protocol family:
+.BR tcp ,
+.BR tcp6 ,
+.BR udp ,
+or
+.BR udp6 .
+.TP
+.B State
+TCP state name for TCP sockets; a bare
+.B \-
+for UDP sockets (which are stateless at the kernel level).
+.TP
+.B Local\ Address
+Local IP address and port number in the form
+.IR addr : port .
+IPv6 addresses are bracketed:
+.RI [ addr ]: port .
+.TP
+.B Foreign\ Address
+Remote IP address and port number in the same format.
+For listening sockets the remote address is
+.B 0.0.0.0:0
+(IPv4) or
+.BR [::]:0
+(IPv6).
+.TP
+.B PID/Program
+Only present when
+.B \-p
+is given.
+Shows the owning process as
+.IR pid / name ,
+or
+.B \-
+if the socket could not be attributed to any process (permission denied,
+or the socket is in a different network namespace).
+.TP
+.B User
+Username of the socket owner, looked up from the UID field in procfs.
+A lightweight 32-entry cache avoids repeated
+.BR getpwuid (3)
+calls when many sockets share the same owner.
+.SH TCP STATES
+The following TCP state names are recognised by
+.B \-s
+and printed in the State column.
+They correspond to the values defined in RFC\ 793 and
+.IR <linux/tcp.h> .
+.PP
+.TS
+tab(|) allbox;
+lb lb lb
+l l l.
+State name|Code|Meaning
+ESTABLISHED|0x01|Data transfer in progress
+SYN_SENT|0x02|Active open: SYN sent, awaiting SYN-ACK
+SYN_RECV|0x03|Passive open: SYN received, SYN-ACK sent
+FIN_WAIT1|0x04|Active close: FIN sent, awaiting FIN or ACK
+FIN_WAIT2|0x05|FIN acknowledged; awaiting remote FIN
+TIME_WAIT|0x06|Waiting 2×MSL before full close
+CLOSE|0x07|Connection fully closed
+CLOSE_WAIT|0x08|Passive close: remote FIN received; local close pending
+LAST_ACK|0x09|Passive close FIN sent; awaiting final ACK
+LISTEN|0x0A|Server socket accepting connections
+CLOSING|0x0B|Both sides closing simultaneously
+.TE
+.SH ANOMALY DETECTION
+After each scan
+.B my_net
+compares per-state counts against the following thresholds.
+When any threshold is exceeded, an
+.B [ANOMALY DETECTED]
+block is appended after the TCP state summary.
+.PP
+.TS
+tab(|) allbox;
+lb rb lb
+l r l.
+State|Threshold|Likely cause
+TIME_WAIT|> 500|High connection churn; consider enabling \fInet.ipv4.tcp_tw_reuse\fR
+CLOSE_WAIT|> 20|Application not calling \fBclose\fR(2) \(em connection leak
+SYN_RECV|> 100|Possible SYN flood attack
+LAST_ACK|> 50|Peer not responding to FIN (network fault or remote crash)
+FIN_WAIT2|> 100|Half-open connection backlog; check \fInet.ipv4.tcp_fin_timeout\fR
+ESTABLISHED|> 10000|Unusually high connection count; possible resource leak
+.TE
+.PP
+Thresholds are derived from common production experience and Linux kernel
+documentation.
+They are intentionally conservative; a single warning does not always
+indicate a real problem but merits investigation.
+.SH WATCH MODE
+.B my_net \-w
+.I SEC
+runs in a loop, clearing the terminal and re-printing the full connection
+table every
+.I SEC
+seconds.
+The status bar at the top of the screen shows the current refresh interval
+and which protocol families are active.
+.PP
+.TS
+tab(|);
+lb lb.
+Key|Action
+Q or q|Quit watch mode and restore the terminal
+.TE
+.PP
+.B my_net
+hides the cursor during watch mode and restores it on exit.
+If stdout is not a terminal, watch mode is rejected with an error; use
+.B \-b
+for non-interactive periodic output.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Invalid argument, missing terminal (for
+.B \-w
+without
+.BR \-b ),
+or unrecoverable system call failure.
+.SH EXAMPLES
+.TP
+List all TCP connections (default):
+.B my_net
+.TP
+List all TCP connections with PID and program name (run as root for full view):
+.B my_net \-p
+.TP
+Show only listening TCP sockets with owner:
+.B my_net \-l \-p
+.TP
+Show all sockets (TCP + UDP) in batch mode, suitable for scripting:
+.B my_net \-a \-b
+.TP
+Filter to ESTABLISHED connections only:
+.B my_net \-s ESTABLISHED
+.TP
+Show UDP sockets with PID:
+.B my_net \-u \-p
+.TP
+Watch all connections, refreshing every 3 seconds:
+.B my_net \-a \-w 3
+.TP
+Count ESTABLISHED connections, compare with ss(8):
+.nf
+my_net \-s ESTABLISHED \-b | grep \-cE \(aq^tcp\(aq
+ss \-tn | grep \-c ESTAB
+.fi
+.TP
+Log connection state every 10 seconds to a file:
+.B my_net \-a \-b \-w 10 >> /var/log/net_snapshot.log
+.SH IMPLEMENTATION NOTES
+.SS Address Parsing
+IPv4 addresses in
+.I /proc/net/tcp
+are stored as a single little-endian 32-bit integer in hexadecimal.
+.B my_net
+reads each address with a custom 8-character hex parser
+.RI ( parse_hex8 )
+and casts directly to
+.B in_addr_t
+for
+.BR inet_ntoa (3).
+.PP
+IPv6 addresses in
+.I /proc/net/tcp6
+are stored as four consecutive host-endian 32-bit words.
+Each word is converted via
+.BR htonl (3)
+before being packed into an
+.B in6_addr
+and formatted with
+.BR inet_ntop (3).
+The bracketed
+.RI [ addr ]: port
+notation follows RFC\ 3986.
+.SS PID Resolution
+When
+.B \-p
+is given,
+.B my_net
+builds an inode\(->PID map by scanning
+.I /proc/<pid>/fd/
+for each process using the
+.BR getdents64 (2)
+system call directly (avoiding
+.BR opendir / readdir
+overhead).
+Symlinks of the form
+.B socket:[<inode>]
+are recorded.
+The resulting table is sorted by inode and searched with binary search,
+giving O(log n) lookup per socket entry.
+Non-root users will only see sockets they own; other entries show
+.BR \- .
+.SS Memory and I/O Optimisation
+To minimise heap allocation on the critical path:
+.IP \(bu 2
+A static 1024-entry memory pool replaces per-entry
+.BR xzalloc .
+The pool is reset (index = 0) between scans rather than individually freed.
+.IP \(bu 2
+.I /proc/net/*
+files are read into a single 256 KB static buffer with one
+.BR read (2)
+call per file, avoiding repeated small reads.
+.IP \(bu 2
+A 128 KB output buffer accumulates formatted lines and is flushed in bulk,
+reducing the number of
+.BR write (2)
+system calls.
+.IP \(bu 2
+A 32-entry UID\(->username cache avoids redundant
+.BR getpwuid (3)
+lookups when many sockets share the same owner.
+.SS Batch / Non-TTY Detection
+If stdout is not connected to a terminal (pipe, file redirection, etc.),
+.B my_net
+automatically activates batch mode and suppresses all ANSI escape sequences,
+even if
+.B \-b
+was not specified.
+This ensures clean plain-text output when used in shell pipelines.
+.SH SEE ALSO
+.BR ss (8),
+.BR netstat (8),
+.BR proc (5),
+.BR socket (7),
+.BR tcp (7),
+.BR udp (7),
+.BR ip (7),
+.BR my_proc (1),
+.BR my_fs (1)
+.SH AUTHOR
+kangyulung

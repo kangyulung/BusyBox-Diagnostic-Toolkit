@@ -220,8 +220,8 @@ check() {
 
 # ESTABLISHED count vs ss (allow ±5 tolerance)
 if has_cmd ss; then
-    my_est=$($BUSYBOX my_net -s ESTABLISHED -b 2>/dev/null | grep -cE '^tcp' || echo 0)
-    ss_est=$(ss -tn 2>/dev/null | grep -c ESTAB || echo 0)
+    my_est=$($BUSYBOX my_net -s ESTABLISHED -b 2>/dev/null | awk '/^tcp/{c++} END{print c+0}')
+    ss_est=$(ss -tn 2>/dev/null | awk '/ESTAB/{c++} END{print c+0}')
     diff_e=$(( my_est > ss_est ? my_est - ss_est : ss_est - my_est ))
     if [ "$diff_e" -le 5 ]; then
         check "ESTABLISHED count matches ss (±5): my=$my_est ss=$ss_est" "ok"

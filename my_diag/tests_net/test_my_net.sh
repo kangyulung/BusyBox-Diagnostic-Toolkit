@@ -166,16 +166,16 @@ fi
 echo ""
 echo "--- Group 5: PID resolution ---"
 
-# T14: PID/Program column exists in output header
-if $BUSYBOX my_net -b 2>/dev/null | head -1 | grep -q "PID"; then
-    pass "T14 PID/Program column in header"
+# T14: PID/Program column exists in output header when -p is given
+if $BUSYBOX my_net -b -p 2>/dev/null | head -1 | grep -q "PID"; then
+    pass "T14 -p: PID/Program column present in header"
 else
-    fail "T14 PID/Program column missing from header"
+    fail "T14 -p: PID/Program column missing from header"
 fi
 
 # T15: At least one row shows a numeric PID (if run as root or owns sockets)
 if [ "$(id -u)" -eq 0 ]; then
-    pid_found=$($BUSYBOX my_net -b 2>/dev/null \
+    pid_found=$($BUSYBOX my_net -b -p 2>/dev/null \
                 | grep -E '^tcp' | grep -cE '[0-9]+/[a-zA-Z]')
     if [ "${pid_found:-0}" -gt 0 ]; then
         pass "T15 PID resolved: found $pid_found rows with PID/program (root)"
@@ -183,7 +183,7 @@ if [ "$(id -u)" -eq 0 ]; then
         skip "T15 PID resolved: 0 rows with PID (no listening sockets in container?)"
     fi
 else
-    pid_found=$($BUSYBOX my_net -b 2>/dev/null \
+    pid_found=$($BUSYBOX my_net -b -p 2>/dev/null \
                 | grep -E '^tcp' | grep -cE '[0-9]+/[a-zA-Z]')
     pass "T15 PID resolution attempt OK (non-root, found ${pid_found:-0})"
 fi
