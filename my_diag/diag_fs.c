@@ -440,7 +440,6 @@ static void print_entries(const fs_entry_t *e, int n, int human, int inode, int 
 static void print_file_frag(const char *path)
 {
     diag_frag_t f;
-    struct statfs sfs;
     uint64_t blk_size, blocks, expected_phy;
     uint32_t i;
 
@@ -449,8 +448,8 @@ static void print_file_frag(const char *path)
         return;
     }
 
-    /* f_bsize：filesystem 宣告的 block size，filefrag 用此欄位換算 */
-    blk_size = (statfs(path, &sfs) == 0 && sfs.f_bsize > 0) ? (uint64_t)sfs.f_bsize : 4096;
+    /* block_size 由 libdiag 從 fstat.st_blksize 帶出，免再呼叫 statfs */
+    blk_size = f.block_size > 0 ? (uint64_t)f.block_size : 4096;
     blocks   = (f.file_size + blk_size - 1) / blk_size;
 
     printf("File size of %s is %llu (%llu block%s of %llu bytes)\n",

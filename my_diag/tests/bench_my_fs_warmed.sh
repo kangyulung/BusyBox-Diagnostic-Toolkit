@@ -20,7 +20,7 @@
 # Output: Markdown table to stdout.
 
 BUSYBOX="${1:-./busybox}"
-REPEAT=100              # iterations per measurement round
+REPEAT=500              # iterations per measurement round
 MIN_APP_MS=$(awk "BEGIN { printf \"%.2f\", 5 / $REPEAT }")  # noise floor: 5 iter-equiv
 WARMUP_ROUNDS=200       # iterations of each binary during warm-up
 MEDIAN_OF=3             # measurement rounds per case (odd number; median is reported)
@@ -86,16 +86,16 @@ row() {
             note=" ℹ"
         fi
     fi
-    printf "| %-35s | %6s ms | %6s ms | %6s ms | %6s ms | %5s | %5s |%s\n" \
+    printf "| %-40s | %6s ms | %6s ms | %6s ms | %6s ms | %5s | %5s |%s\n" \
         "$label" "$a" "$a_app" "$b" "$b_app" "$ratio" "$app_ratio" "$note"
 }
 
 print_table_header() {
     local ref_label=$1
-    printf "| %-35s | %-9s | %-9s | %-9s | %-9s | %-5s | %-5s |\n" \
+    printf "| %-40s | %-9s | %-9s | %-9s | %-9s | %-5s | %-5s |\n" \
         "Case" "my_fs tot" "my_fs app" "ref tot" "ref app" "Total" "App"
     printf "|%s|%s|%s|%s|%s|%s|%s|\n" \
-        "$(printf '%37s' '' | tr ' ' '-')" \
+        "$(printf '%42s' '' | tr ' ' '-')" \
         "$(printf '%11s' '' | tr ' ' '-')" \
         "$(printf '%11s' '' | tr ' ' '-')" \
         "$(printf '%11s' '' | tr ' ' '-')" \

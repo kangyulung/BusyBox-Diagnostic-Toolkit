@@ -45,6 +45,7 @@ typedef struct {
 typedef struct {
     uint64_t              file_size;    /* 檔案大小（bytes） */
     uint32_t              extent_count; /* extent 總數 */
+    uint32_t              block_size;   /* fstat.st_blksize；caller 用於 byte↔block 換算，免再呼叫 statfs */
     struct fiemap_extent *extents;      /* 詳細清單；NULL 表示未收集（需呼叫 diag_free_frag 釋放） */
 } diag_frag_t;
 
