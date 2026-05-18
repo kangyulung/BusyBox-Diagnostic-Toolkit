@@ -866,8 +866,7 @@ static void show_fs_tui(void)
     g_tui_active = 1;
     atexit(tui_atexit);
     bb_signals(BB_FATAL_SIGS, tui_sig_handler);
-    printf(DIAG_HIDE);
-    fflush(stdout);
+    /* 游標隱藏由 diag_ui_mode_raw 負責，不在此重複輸出 DIAG_HIDE */
 
     while (1) {
         char c = 0;
@@ -904,8 +903,7 @@ static void show_fs_tui(void)
     g_tui_mount_cache = NULL;
 
     g_tui_active = 0;
-    printf(DIAG_SHOW);
-    fflush(stdout);
+    /* 游標恢復由 diag_ui_mode_normal 負責，不在此重複輸出 DIAG_SHOW */
     diag_ui_mode_normal(&g_tui_saved_termios);
     printf("\n");
     fflush(stdout);
