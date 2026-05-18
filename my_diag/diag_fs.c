@@ -939,19 +939,34 @@ int my_fs_main(int argc, char **argv)
         for (arg = argv; *arg; arg++) {
             mount_node_t *m, *best = NULL;
             size_t best_len = 0;
+            char *canon;
+            const char *cpath;
 
             if (get_fs_entry(*arg, &entries[n]) != 0) {
                 bb_perror_msg("%s", *arg);
                 had_error = 1;
                 continue;
             }
+            /* 對齊 df：先 realpath 正規化為絕對路徑（解 relative path /
+             * symlink / .. ），再做「邊界感知的最長掛載點前綴」比對。
+             * 邊界檢查避免 /foo 誤吃 /foobar；以最長前綴選最深掛載點，
+             * 在多個 bind mount（同裝置不同 mountpoint）時也能選對。 */
+            canon = xmalloc_realpath(*arg);
+            cpath = canon ? canon : *arg;
             for (m = mounts; m; m = m->next) {
                 size_t len = strlen(m->mountpoint);
-                if (strncmp(*arg, m->mountpoint, len) == 0 && len > best_len) {
+                if (strncmp(cpath, m->mountpoint, len) != 0) continue;
+                /* mountpoint=="/" 時 mountpoint[len-1]=='/' 恆相符；
+                 * 否則要求 cpath 在 len 處為結尾或路徑分隔符 */
+                if (!(m->mountpoint[len - 1] == '/'
+                      || cpath[len] == '\0' || cpath[len] == '/'))
+                    continue;
+                if (!best || len > best_len) {
                     best = m;
                     best_len = len;
                 }
             }
+            free(canon);
             if (best) {
                 if ((has_t && strcmp(best->fstype, opt_t) != 0)
                  || (has_x && strcmp(best->fstype, opt_x) == 0)) {
@@ -960,6 +975,9 @@ int my_fs_main(int argc, char **argv)
                 }
                 entries[n].device = xstrdup(best->device);
                 entries[n].fstype = xstrdup(best->fstype);
+                /* Mounted on 對齊 df：顯示實際掛載點而非使用者輸入字串 */
+                free(entries[n].path);
+                entries[n].path = xstrdup(best->mountpoint);
             } else {
                 entries[n].device = xstrdup(*arg);
             }
