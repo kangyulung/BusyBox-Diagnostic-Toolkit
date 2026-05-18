@@ -28,6 +28,7 @@
 #include <mntent.h>
 #include <termios.h>
 #include <ctype.h>
+#include <signal.h>
 
 /* 掛載點清單節點（解析自 /proc/mounts）。
  * 三個字串為 xstrdup 配置，由 free_mount_list 釋放；
@@ -751,15 +752,51 @@ static int tui_read_key(char *out)
     return 1;
 }
 
+/* TUI 異常離開的還原機制：
+ * raw mode 一旦開啟，必須在「正常 Q 離開」「Ctrl-C / SIGTERM / SIGHUP」
+ * 「迴圈中 x* allocator die」三種路徑都還原 termios 與游標，
+ * 否則 shell 會卡在 raw mode、游標維持隱藏，需手動 stty sane / reset。 */
+static struct termios     g_tui_saved_termios;
+static volatile sig_atomic_t g_tui_active = 0;
+
+/* 還原 termios 與游標。可能在 signal handler 中執行，
+ * 故僅用 async-signal-safe 的 tcsetattr() 與 write()，不碰 stdio。 */
+static void tui_restore(void)
+{
+    static const char show_cursor[] = DIAG_SHOW;
+    if (!g_tui_active)
+        return;
+    g_tui_active = 0;
+    tcsetattr(STDIN_FILENO, TCSANOW, &g_tui_saved_termios);
+    write(STDOUT_FILENO, show_cursor, sizeof(show_cursor) - 1);
+}
+
+/* atexit hook：涵蓋 BusyBox x* allocator 在迴圈中 die 的情況 */
+static void tui_atexit(void)
+{
+    tui_restore();
+}
+
+/* fatal signal handler：還原後回復預設處置並重發訊號，
+ * 讓行程以正確的 128+signo 狀態結束。 */
+static void tui_sig_handler(int sig)
+{
+    tui_restore();
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
 static void show_fs_tui(void)
 {
-    struct termios old_t;
     struct pollfd  pfd = { STDIN_FILENO, POLLIN, 0 };
 
     if (!isatty(STDOUT_FILENO))
         bb_error_msg_and_die("-s requires a terminal");
 
-    diag_ui_mode_raw(&old_t);
+    diag_ui_mode_raw(&g_tui_saved_termios);
+    g_tui_active = 1;
+    atexit(tui_atexit);
+    bb_signals(BB_FATAL_SIGS, tui_sig_handler);
     printf(DIAG_HIDE);
     fflush(stdout);
 
@@ -796,9 +833,10 @@ static void show_fs_tui(void)
     free_mount_list(g_tui_mount_cache);
     g_tui_mount_cache = NULL;
 
+    g_tui_active = 0;
     printf(DIAG_SHOW);
     fflush(stdout);
-    diag_ui_mode_normal(&old_t);
+    diag_ui_mode_normal(&g_tui_saved_termios);
     printf("\n");
     fflush(stdout);
 }
