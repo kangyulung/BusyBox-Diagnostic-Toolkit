@@ -510,6 +510,7 @@ struct l2_top_entry {
 struct l2_ctx {
     uint64_t            total;
     uint64_t            frag;
+    uint64_t            skipped;   /* FTW_F 但 FIEMAP 失敗（無權限/不支援）*/
     uint64_t            dist[4];   /* [0]=1, [1]=2-4, [2]=5-16, [3]=17+ */
     struct l2_top_entry top[L2_TOP_N];
     int                 top_count;
@@ -526,7 +527,12 @@ static int l2_nftw_cb(const char *path, const struct stat *sb,
     (void)sb; (void)ftwbuf;
     if (typeflag != FTW_F) return 0;
 
-    if (diag_read_fragmentation(path, &f, 0) != 0) return 0;
+    if (diag_read_fragmentation(path, &f, 0) != 0) {
+        /* 一般檔案但無法做 FIEMAP（無讀取權限 / fs 不支援），
+         * 計入 skipped 以免 total 與碎片率分母被低估 */
+        g_l2.skipped++;
+        return 0;
+    }
 
     g_l2.total++;
 
@@ -582,9 +588,14 @@ static int print_frag_stat(const char *path)
 
     frag_pct = (g_l2.total > 0)
                ? (double)g_l2.frag * 100.0 / (double)g_l2.total : 0.0;
-    printf("Scanned: %llu files  Fragmented: %llu (%.1f%%)\n\n",
+    printf("Scanned: %llu files  Fragmented: %llu (%.1f%%)  Skipped: %llu\n",
            (unsigned long long)g_l2.total,
-           (unsigned long long)g_l2.frag, frag_pct);
+           (unsigned long long)g_l2.frag, frag_pct,
+           (unsigned long long)g_l2.skipped);
+    if (g_l2.skipped > 0)
+        printf("(skipped = no read permission or filesystem without FIEMAP;"
+               " run as root for full coverage)\n");
+    printf("\n");
 
     printf("Fragmentation distribution:\n");
     printf("  %-10s  %s\n",   "Extents", "Files");
@@ -753,9 +764,11 @@ static void tui_print_frag_view(void)
     pct = (c->total > 0) ? (double)c->frag * 100.0 / (double)c->total : 0.0;
 
     printf("Scan path: /" DIAG_CLR_EOL "\n");
-    printf("Scanned: %llu files  Fragmented: %llu (%.1f%%)" DIAG_CLR_EOL "\n\n",
+    printf("Scanned: %llu files  Fragmented: %llu (%.1f%%)  Skipped: %llu"
+           DIAG_CLR_EOL "\n\n",
            (unsigned long long)c->total,
-           (unsigned long long)c->frag, pct);
+           (unsigned long long)c->frag, pct,
+           (unsigned long long)c->skipped);
     printf("Fragmentation distribution:" DIAG_CLR_EOL "\n");
     printf("  %-10s  %s" DIAG_CLR_EOL "\n",   "Extents", "Files");
     printf("  %-10s  %llu" DIAG_CLR_EOL "\n", "1",    (unsigned long long)c->dist[0]);
