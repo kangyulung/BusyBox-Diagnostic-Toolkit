@@ -805,9 +805,17 @@ static void tui_print_frag_view(void)
 static int tui_read_key(char *out)
 {
     struct pollfd pfd = { STDIN_FILENO, POLLIN, 0 };
+    char c;
     if (safe_poll(&pfd, 1, 0) <= 0) return 0;
-    if (read(STDIN_FILENO, out, 1) <= 0) return 0;
-    *out = (char)toupper((unsigned char)*out);
+    if (read(STDIN_FILENO, &c, 1) <= 0) return 0;
+    if (c == 27) {
+        /* ESC：吞掉後續 escape sequence（方向鍵等 ESC [ X），
+         * 否則左方向鍵 ESC [ D 的 'D' 會被當成 Disk view hotkey */
+        while (safe_poll(&pfd, 1, 0) > 0 && read(STDIN_FILENO, &c, 1) == 1)
+            continue;
+        return 0;
+    }
+    *out = (char)toupper((unsigned char)c);
     return 1;
 }
 
