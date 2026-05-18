@@ -475,10 +475,18 @@ static int print_file_frag(const char *path)
             if (i > 0 && phy_start != expected_phy)
                 snprintf(exp_str, sizeof(exp_str), "%llu", (unsigned long long)expected_phy);
 
-            if (e->fe_flags & FIEMAP_EXTENT_LAST)     strcat(flags, "last,eof");
-            if (e->fe_flags & FIEMAP_EXTENT_UNKNOWN)  strcat(flags, "unknown ");
-            if (e->fe_flags & FIEMAP_EXTENT_DELALLOC) strcat(flags, "delalloc ");
-            if (e->fe_flags & FIEMAP_EXTENT_ENCODED)  strcat(flags, "encoded ");
+            /* 以逗號連接，避免多旗標時黏成 "last,eofunknown " */
+#define ADD_FLAG(bit, name) do {                  \
+                if (e->fe_flags & (bit)) {        \
+                    if (flags[0]) strcat(flags, ","); \
+                    strcat(flags, (name));        \
+                }                                 \
+            } while (0)
+            ADD_FLAG(FIEMAP_EXTENT_LAST,     "last,eof");
+            ADD_FLAG(FIEMAP_EXTENT_UNKNOWN,  "unknown");
+            ADD_FLAG(FIEMAP_EXTENT_DELALLOC, "delalloc");
+            ADD_FLAG(FIEMAP_EXTENT_ENCODED,  "encoded");
+#undef ADD_FLAG
 
             printf(" %3u:  %7llu..%8llu:  %9llu..%10llu: %6llu: %10s  %s\n",
                    i,
