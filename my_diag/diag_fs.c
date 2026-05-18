@@ -632,19 +632,33 @@ static void tui_refresh_mount_cache(void)
     g_tui_mount_cache_ts = now;
 }
 
-/* 收集所有有效掛載點的 fs_entry_t；*out 需呼叫 free() 釋放。
- * mounts 的生命週期由呼叫端管理，此函式不釋放它。 */
-static int collect_all_entries(mount_node_t *mounts, fs_entry_t **out)
+/* 掃描 mounts，依 st_dev 去重，回傳 fs_entry_t 陣列。
+ * 回傳筆數；*out 需逐筆 free_fs_entry() 後再 free() 陣列。
+ * has_t/opt_t、has_x/opt_x 為類型過濾（傳 0/NULL 即不過濾，供 TUI 用）。
+ * 採「第一遍即暫存 statfs 結果並轉移字串擁有權」，每唯一掛載點只 statfs 一次；
+ * seen 三陣列依 mount 數動態配置，無固定 256 上限。
+ * mounts 生命週期由呼叫端管理，此函式不釋放它。 */
+static int collect_dedup_entries(mount_node_t *mounts,
+                                 int has_t, const char *opt_t,
+                                 int has_x, const char *opt_x,
+                                 fs_entry_t **out)
 {
-    dev_t         seen_dev[256];
-    mount_node_t *seen_node[256];
-    int           seen_n = 0, n = 0, i;
+    int           mount_count = 0, seen_n = 0, n = 0, i;
     mount_node_t *m;
 
+    for (m = mounts; m; m = m->next) mount_count++;
+    if (mount_count == 0) mount_count = 1;   /* xzalloc(0) 防呆 */
+
+    dev_t         *seen_dev   = xzalloc(mount_count * sizeof(dev_t));
+    mount_node_t **seen_node  = xzalloc(mount_count * sizeof(mount_node_t *));
+    fs_entry_t    *seen_entry = xzalloc(mount_count * sizeof(fs_entry_t));
+
     for (m = mounts; m; m = m->next) {
-        fs_entry_t tmp;
+        fs_entry_t  tmp;
         struct stat sb;
         memset(&tmp, 0, sizeof(tmp));
+        if (has_t && strcmp(m->fstype, opt_t) != 0) continue;
+        if (has_x && strcmp(m->fstype, opt_x) == 0) continue;
         if (get_fs_entry(m->mountpoint, &tmp) != 0 || tmp.total_1k == 0) {
             free_fs_entry(&tmp);
             continue;
@@ -655,23 +669,34 @@ static int collect_all_entries(mount_node_t *mounts, fs_entry_t **out)
         }
         int found = 0;
         for (i = 0; i < seen_n; i++) {
-            if (seen_dev[i] == sb.st_dev) { seen_node[i] = m; found = 1; break; }
+            if (seen_dev[i] == sb.st_dev) {
+                seen_node[i]  = m;
+                /* 同裝置 bind mount：先釋放舊條目字串，再轉移 tmp 擁有權 */
+                free_fs_entry(&seen_entry[i]);
+                seen_entry[i] = tmp;
+                found = 1;
+                break;
+            }
         }
-        if (!found && seen_n < 256) {
-            seen_dev[seen_n]  = sb.st_dev;
-            seen_node[seen_n] = m;
+        if (!found) {
+            /* seen_n 必 < mount_count（每唯一掛載點僅 +1），無需上限檢查 */
+            seen_dev[seen_n]   = sb.st_dev;
+            seen_node[seen_n]  = m;
+            seen_entry[seen_n] = tmp;   /* 轉移擁有權 */
             seen_n++;
         }
-        free_fs_entry(&tmp);
     }
 
     fs_entry_t *entries = xzalloc((seen_n ? seen_n : 1) * sizeof(fs_entry_t));
     for (i = 0; i < seen_n; i++) {
-        if (get_fs_entry(seen_node[i]->mountpoint, &entries[n]) != 0) continue;
+        entries[n] = seen_entry[i];                  /* 轉移字串擁有權 */
         entries[n].device = xstrdup(seen_node[i]->device);
         entries[n].fstype = xstrdup(seen_node[i]->fstype);
         n++;
     }
+    free(seen_dev);
+    free(seen_node);
+    free(seen_entry);   /* 字串擁有權已轉移至 entries，只釋放陣列 */
     *out = entries;
     return n;
 }
@@ -824,7 +849,8 @@ static void show_fs_tui(void)
         } else {
             tui_refresh_mount_cache();
             fs_entry_t *entries = NULL;
-            int i, n = collect_all_entries(g_tui_mount_cache, &entries);
+            int i, n = collect_dedup_entries(g_tui_mount_cache,
+                                             0, NULL, 0, NULL, &entries);
             print_entries(entries, n, g_tui_human,
                           g_tui_view == FS_VIEW_INODE,
                           g_tui_view == FS_VIEW_RESERVED);
@@ -873,62 +899,7 @@ int my_fs_main(int argc, char **argv)
     int           had_error = 0;
 
     if (!argv[0]) {
-        dev_t         seen_dev[256];
-        mount_node_t *seen_node[256];
-        /* 先計算掛載點數量，按實際大小分配（避免 256 × ~8 KB 固定清零） */
-        int           mount_count = 0;
-        mount_node_t *m;
-        for (m = mounts; m; m = m->next) mount_count++;
-        fs_entry_t   *seen_entry = xzalloc((mount_count ? mount_count : 1) * sizeof(fs_entry_t));
-        int           seen_n = 0;
-
-        /* 第一遍：先以 -t/-x 類型過濾，再呼叫 statfs()，
-         * 同時將結果暫存於 seen_entry，消除第二遍重複呼叫 statfs() */
-        for (m = mounts; m; m = m->next) {
-            fs_entry_t  tmp;
-            struct stat sb;
-            memset(&tmp, 0, sizeof(tmp));
-            if (has_t && strcmp(m->fstype, opt_t) != 0) continue;
-            if (has_x && strcmp(m->fstype, opt_x) == 0) continue;
-            if (get_fs_entry(m->mountpoint, &tmp) != 0 || tmp.total_1k == 0) {
-                free_fs_entry(&tmp);
-                continue;
-            }
-            if (stat(m->mountpoint, &sb) != 0) {
-                free_fs_entry(&tmp);
-                continue;
-            }
-            int found = 0;
-            for (i = 0; i < seen_n; i++) {
-                if (seen_dev[i] == sb.st_dev) {
-                    seen_node[i]  = m;
-                    /* 同裝置 bind mount：先釋放舊條目的字串，再轉移 tmp 的擁有權 */
-                    free_fs_entry(&seen_entry[i]);
-                    seen_entry[i] = tmp;
-                    found = 1;
-                    break;
-                }
-            }
-            if (!found && seen_n < 256) {
-                seen_dev[seen_n]   = sb.st_dev;
-                seen_node[seen_n]  = m;
-                seen_entry[seen_n] = tmp;   /* 轉移擁有權 */
-                seen_n++;
-            } else if (!found) {
-                /* 超過 256 個唯一掛載點，丟棄 tmp */
-                free_fs_entry(&tmp);
-            }
-        }
-
-        /* 第二遍：轉移 seen_entry 擁有權至 entries，並補上 device/fstype */
-        entries = xzalloc((seen_n ? seen_n : 1) * sizeof(fs_entry_t));
-        for (i = 0; i < seen_n; i++) {
-            entries[n] = seen_entry[i];                  /* shallow copy（轉移字串擁有權） */
-            entries[n].device = xstrdup(seen_node[i]->device);
-            entries[n].fstype = xstrdup(seen_node[i]->fstype);
-            n++;
-        }
-        free(seen_entry);   /* 字串擁有權已轉移至 entries，只釋放陣列 */
+        n = collect_dedup_entries(mounts, has_t, opt_t, has_x, opt_x, &entries);
     } else {
         /* 有參數：對每個路徑收集 fs_entry_t */
         char **arg;
