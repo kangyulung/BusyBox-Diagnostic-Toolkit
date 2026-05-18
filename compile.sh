@@ -8,8 +8,12 @@ rm -f my_diag/Config.in my_diag/Kbuild
 echo "Removing object files in my_diag..."
 #find my_diag -name "*.o" -type f -
 # 先確認清單
-find my_diag -type f ! -name "*.c" ! -name "*.src" ! -name "*.h" ! -name "*.md" ! -name "*.sh" ! -name "*.1" -delete
+find my_diag -type f ! -name "*.c" ! -name "*.src" ! -name "*.h" ! -name "*.md" ! -name "*.sh" ! -name "*.1" ! -name ".clang-format" -delete
 
+
+# 3. 格式化 my_diag 原始碼
+echo "Formatting my_diag source files with clang-format..."
+find my_diag -maxdepth 1 \( -name "*.c" -o -name "*.h" \) -exec clang-format -i {} +
 
 echo "Generating build files..."
 #make gen_build_files

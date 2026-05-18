@@ -1,4 +1,5 @@
 /* vi: set sw=4 ts=4: */
+// clang-format off
 //config:config MY_NET
 //config:   bool "my_net"
 //config:   default y
@@ -11,6 +12,7 @@
 
 //usage:#define my_net_trivial_usage "None"
 //usage:#define my_net_full_usage "None"
+// clang-format on
 
 #include "libbb.h"
 #include "libdiag.h"
@@ -19,6 +21,6 @@
 int my_net_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
 int my_net_main(int argc, char **argv)
 {
-    printf("Hello, BusyBox Custom Folder!\n");
-    return EXIT_SUCCESS;
+	printf("Hello, BusyBox Custom Folder!\n");
+	return EXIT_SUCCESS;
 }
