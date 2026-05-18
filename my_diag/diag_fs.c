@@ -619,7 +619,7 @@ static int print_frag_stat(const char *path)
 
     if (g_l2.top_count > 0) {
         qsort(g_l2.top, g_l2.top_count, sizeof(g_l2.top[0]), cmp_top_entry);
-        printf("\nTop %d most fragmented:\n", g_l2.top_count);
+        printf("\nTop %d files by extent count:\n", g_l2.top_count);
         printf("  %7s  %s\n", "Extents", "File");
         for (i = 0; i < g_l2.top_count; i++)
             printf("  %7u  %s\n", g_l2.top[i].extents, g_l2.top[i].path);
@@ -797,7 +797,7 @@ static void tui_print_frag_view(void)
 
     if (c->top_count > 0) {
         qsort(c->top, c->top_count, sizeof(c->top[0]), cmp_top_entry);
-        printf("\nTop %d most fragmented:" DIAG_CLR_EOL "\n", c->top_count);
+        printf("\nTop %d files by extent count:" DIAG_CLR_EOL "\n", c->top_count);
         printf("  %7s  %s" DIAG_CLR_EOL "\n", "Extents", "File");
         for (i = 0; i < c->top_count; i++)
             printf("  %7u  %s" DIAG_CLR_EOL "\n",
