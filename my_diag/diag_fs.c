@@ -636,10 +636,16 @@ static time_t        g_tui_mount_cache_ts = 0;
 static void tui_refresh_mount_cache(void)
 {
     time_t now = time(NULL);
+    mount_node_t *fresh;
     if (g_tui_mount_cache && (now - g_tui_mount_cache_ts) < MOUNT_CACHE_TTL)
         return;
+    /* 取新清單成功才替換舊的；失敗則保留舊 cache 且不更新 ts，
+     * 下一輪會再重試，避免暫時讀取失敗就把畫面清成空表 */
+    fresh = get_mount_list();
+    if (!fresh)
+        return;
     free_mount_list(g_tui_mount_cache);
-    g_tui_mount_cache    = get_mount_list();
+    g_tui_mount_cache    = fresh;
     g_tui_mount_cache_ts = now;
 }
 
@@ -912,6 +918,13 @@ int my_fs_main(int argc, char **argv)
     int           had_error = 0;
 
     if (!argv[0]) {
+        /* no-arg 模式必須能列舉掛載表；NULL = setmntent 開啟失敗
+         * （Linux /proc/mounts 恆有資料，空清單不視為正常狀況），
+         * 明確回報而非靜默印空表後回 0 */
+        if (!mounts) {
+            bb_perror_msg("%s", bb_path_mtab_file);
+            return EXIT_FAILURE;
+        }
         n = collect_dedup_entries(mounts, has_t, opt_t, has_x, opt_x, &entries);
     } else {
         /* 有參數：對每個路徑收集 fs_entry_t */
