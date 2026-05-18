@@ -28,6 +28,12 @@
 #include <mntent.h>
 #include <termios.h>
 #include <ctype.h>
+#include <signal.h>
+
+/* 游標歸位 + 清螢幕。複用共用標頭的 DIAG_CLR_SCR（僅 "\033[H" 歸位，
+ * 為 my_proc 共用、不可改其語意），再補 "\033[J" 清除至螢幕尾；
+ * 此巨集為 diag_fs.c 私有，避免裸 ANSI 字面值散落各處。 */
+#define MYFS_CLR_SCREEN  DIAG_CLR_SCR "\033[J"
 
 /* 掛載點清單節點（解析自 /proc/mounts）。
  * 三個字串為 xstrdup 配置，由 free_mount_list 釋放；
@@ -437,7 +443,7 @@ static void print_entries(const fs_entry_t *e, int n, int human, int inode, int 
 
 /* ── L1：-f FILE 單檔碎片分析 ── */
 
-static void print_file_frag(const char *path)
+static int print_file_frag(const char *path)
 {
     diag_frag_t f;
     uint64_t blk_size, blocks, expected_phy;
@@ -445,7 +451,7 @@ static void print_file_frag(const char *path)
 
     if (diag_read_fragmentation(path, &f, 1) != 0) {
         bb_perror_msg("%s", path);
-        return;
+        return EXIT_FAILURE;
     }
 
     /* block_size 由 libdiag 從 fstat.st_blksize 帶出，免再呼叫 statfs */
@@ -474,10 +480,18 @@ static void print_file_frag(const char *path)
             if (i > 0 && phy_start != expected_phy)
                 snprintf(exp_str, sizeof(exp_str), "%llu", (unsigned long long)expected_phy);
 
-            if (e->fe_flags & FIEMAP_EXTENT_LAST)     strcat(flags, "last,eof");
-            if (e->fe_flags & FIEMAP_EXTENT_UNKNOWN)  strcat(flags, "unknown ");
-            if (e->fe_flags & FIEMAP_EXTENT_DELALLOC) strcat(flags, "delalloc ");
-            if (e->fe_flags & FIEMAP_EXTENT_ENCODED)  strcat(flags, "encoded ");
+            /* 以逗號連接，避免多旗標時黏成 "last,eofunknown " */
+#define ADD_FLAG(bit, name) do {                  \
+                if (e->fe_flags & (bit)) {        \
+                    if (flags[0]) strcat(flags, ","); \
+                    strcat(flags, (name));        \
+                }                                 \
+            } while (0)
+            ADD_FLAG(FIEMAP_EXTENT_LAST,     "last,eof");
+            ADD_FLAG(FIEMAP_EXTENT_UNKNOWN,  "unknown");
+            ADD_FLAG(FIEMAP_EXTENT_DELALLOC, "delalloc");
+            ADD_FLAG(FIEMAP_EXTENT_ENCODED,  "encoded");
+#undef ADD_FLAG
 
             printf(" %3u:  %7llu..%8llu:  %9llu..%10llu: %6llu: %10s  %s\n",
                    i,
@@ -493,6 +507,7 @@ static void print_file_frag(const char *path)
     printf("%s: %u extent%s found\n", path,
            f.extent_count, f.extent_count == 1 ? "" : "s");
     diag_free_frag(&f);
+    return EXIT_SUCCESS;
 }
 
 /* ── L2：-F PATH 掛載點碎片統計 ── */
@@ -508,6 +523,7 @@ struct l2_top_entry {
 struct l2_ctx {
     uint64_t            total;
     uint64_t            frag;
+    uint64_t            skipped;   /* FTW_F 但 FIEMAP 失敗（無權限/不支援）*/
     uint64_t            dist[4];   /* [0]=1, [1]=2-4, [2]=5-16, [3]=17+ */
     struct l2_top_entry top[L2_TOP_N];
     int                 top_count;
@@ -524,7 +540,12 @@ static int l2_nftw_cb(const char *path, const struct stat *sb,
     (void)sb; (void)ftwbuf;
     if (typeflag != FTW_F) return 0;
 
-    if (diag_read_fragmentation(path, &f, 0) != 0) return 0;
+    if (diag_read_fragmentation(path, &f, 0) != 0) {
+        /* 一般檔案但無法做 FIEMAP（無讀取權限 / fs 不支援），
+         * 計入 skipped 以免 total 與碎片率分母被低估 */
+        g_l2.skipped++;
+        return 0;
+    }
 
     g_l2.total++;
 
@@ -564,20 +585,30 @@ static int cmp_top_entry(const void *a, const void *b)
     return (ea->extents > eb->extents) ? -1 : (ea->extents < eb->extents) ? 1 : 0;
 }
 
-static void print_frag_stat(const char *path)
+static int print_frag_stat(const char *path)
 {
     double frag_pct;
     int i;
 
     memset(&g_l2, 0, sizeof(g_l2));
     printf("Scanning %s ...\n\n", path);
-    nftw(path, l2_nftw_cb, 16, FTW_MOUNT | FTW_PHYS);
+    /* nftw 回傳 -1 表示連 root path 都無法走訪（不存在/無權限等）；
+     * callback 一律回 0，故 0 = 正常走完 */
+    if (nftw(path, l2_nftw_cb, 16, FTW_MOUNT | FTW_PHYS) < 0) {
+        bb_perror_msg("%s", path);
+        return EXIT_FAILURE;
+    }
 
     frag_pct = (g_l2.total > 0)
                ? (double)g_l2.frag * 100.0 / (double)g_l2.total : 0.0;
-    printf("Scanned: %llu files  Fragmented: %llu (%.1f%%)\n\n",
+    printf("Scanned: %llu files  Fragmented: %llu (%.1f%%)  Skipped: %llu\n",
            (unsigned long long)g_l2.total,
-           (unsigned long long)g_l2.frag, frag_pct);
+           (unsigned long long)g_l2.frag, frag_pct,
+           (unsigned long long)g_l2.skipped);
+    if (g_l2.skipped > 0)
+        printf("(skipped = no read permission or filesystem without FIEMAP;"
+               " run as root for full coverage)\n");
+    printf("\n");
 
     printf("Fragmentation distribution:\n");
     printf("  %-10s  %s\n",   "Extents", "Files");
@@ -588,11 +619,12 @@ static void print_frag_stat(const char *path)
 
     if (g_l2.top_count > 0) {
         qsort(g_l2.top, g_l2.top_count, sizeof(g_l2.top[0]), cmp_top_entry);
-        printf("\nTop %d most fragmented:\n", g_l2.top_count);
+        printf("\nTop %d files by extent count:\n", g_l2.top_count);
         printf("  %7s  %s\n", "Extents", "File");
         for (i = 0; i < g_l2.top_count; i++)
             printf("  %7u  %s\n", g_l2.top[i].extents, g_l2.top[i].path);
     }
+    return EXIT_SUCCESS;
 }
 
 /* ── P5：互動式 TUI 模式（-s） ── */
@@ -617,26 +649,46 @@ static time_t        g_tui_mount_cache_ts = 0;
 static void tui_refresh_mount_cache(void)
 {
     time_t now = time(NULL);
+    mount_node_t *fresh;
     if (g_tui_mount_cache && (now - g_tui_mount_cache_ts) < MOUNT_CACHE_TTL)
         return;
+    /* 取新清單成功才替換舊的；失敗則保留舊 cache 且不更新 ts，
+     * 下一輪會再重試，避免暫時讀取失敗就把畫面清成空表 */
+    fresh = get_mount_list();
+    if (!fresh)
+        return;
     free_mount_list(g_tui_mount_cache);
-    g_tui_mount_cache    = get_mount_list();
+    g_tui_mount_cache    = fresh;
     g_tui_mount_cache_ts = now;
 }
 
-/* 收集所有有效掛載點的 fs_entry_t；*out 需呼叫 free() 釋放。
- * mounts 的生命週期由呼叫端管理，此函式不釋放它。 */
-static int collect_all_entries(mount_node_t *mounts, fs_entry_t **out)
+/* 掃描 mounts，依 st_dev 去重，回傳 fs_entry_t 陣列。
+ * 回傳筆數；*out 需逐筆 free_fs_entry() 後再 free() 陣列。
+ * has_t/opt_t、has_x/opt_x 為類型過濾（傳 0/NULL 即不過濾，供 TUI 用）。
+ * 採「第一遍即暫存 statfs 結果並轉移字串擁有權」，每唯一掛載點只 statfs 一次；
+ * seen 三陣列依 mount 數動態配置，無固定 256 上限。
+ * mounts 生命週期由呼叫端管理，此函式不釋放它。 */
+static int collect_dedup_entries(mount_node_t *mounts,
+                                 int has_t, const char *opt_t,
+                                 int has_x, const char *opt_x,
+                                 fs_entry_t **out)
 {
-    dev_t         seen_dev[256];
-    mount_node_t *seen_node[256];
-    int           seen_n = 0, n = 0, i;
+    int           mount_count = 0, seen_n = 0, n = 0, i;
     mount_node_t *m;
 
+    for (m = mounts; m; m = m->next) mount_count++;
+    if (mount_count == 0) mount_count = 1;   /* xzalloc(0) 防呆 */
+
+    dev_t         *seen_dev   = xzalloc(mount_count * sizeof(dev_t));
+    mount_node_t **seen_node  = xzalloc(mount_count * sizeof(mount_node_t *));
+    fs_entry_t    *seen_entry = xzalloc(mount_count * sizeof(fs_entry_t));
+
     for (m = mounts; m; m = m->next) {
-        fs_entry_t tmp;
+        fs_entry_t  tmp;
         struct stat sb;
         memset(&tmp, 0, sizeof(tmp));
+        if (has_t && strcmp(m->fstype, opt_t) != 0) continue;
+        if (has_x && strcmp(m->fstype, opt_x) == 0) continue;
         if (get_fs_entry(m->mountpoint, &tmp) != 0 || tmp.total_1k == 0) {
             free_fs_entry(&tmp);
             continue;
@@ -647,23 +699,34 @@ static int collect_all_entries(mount_node_t *mounts, fs_entry_t **out)
         }
         int found = 0;
         for (i = 0; i < seen_n; i++) {
-            if (seen_dev[i] == sb.st_dev) { seen_node[i] = m; found = 1; break; }
+            if (seen_dev[i] == sb.st_dev) {
+                seen_node[i]  = m;
+                /* 同裝置 bind mount：先釋放舊條目字串，再轉移 tmp 擁有權 */
+                free_fs_entry(&seen_entry[i]);
+                seen_entry[i] = tmp;
+                found = 1;
+                break;
+            }
         }
-        if (!found && seen_n < 256) {
-            seen_dev[seen_n]  = sb.st_dev;
-            seen_node[seen_n] = m;
+        if (!found) {
+            /* seen_n 必 < mount_count（每唯一掛載點僅 +1），無需上限檢查 */
+            seen_dev[seen_n]   = sb.st_dev;
+            seen_node[seen_n]  = m;
+            seen_entry[seen_n] = tmp;   /* 轉移擁有權 */
             seen_n++;
         }
-        free_fs_entry(&tmp);
     }
 
     fs_entry_t *entries = xzalloc((seen_n ? seen_n : 1) * sizeof(fs_entry_t));
     for (i = 0; i < seen_n; i++) {
-        if (get_fs_entry(seen_node[i]->mountpoint, &entries[n]) != 0) continue;
+        entries[n] = seen_entry[i];                  /* 轉移字串擁有權 */
         entries[n].device = xstrdup(seen_node[i]->device);
         entries[n].fstype = xstrdup(seen_node[i]->fstype);
         n++;
     }
+    free(seen_dev);
+    free(seen_node);
+    free(seen_entry);   /* 字串擁有權已轉移至 entries，只釋放陣列 */
     *out = entries;
     return n;
 }
@@ -681,7 +744,7 @@ static const char *tui_view_name(void)
 
 static void tui_print_header(void)
 {
-    printf("\033[H\033[J");
+    printf(MYFS_CLR_SCREEN);
     printf(DIAG_CYAN "[MY_FS]" DIAG_RESET
            " View: " DIAG_YELLOW "%s" DIAG_RESET
            "  Human: %s"
@@ -697,7 +760,7 @@ static void tui_print_header(void)
 /* 對 / 執行 nftw 碎片統計，結果存入快取 */
 static void tui_do_frag_scan(void)
 {
-    printf("\033[H\033[J");
+    printf(MYFS_CLR_SCREEN);
     printf(DIAG_YELLOW "Scanning / for fragmentation, please wait..."
            DIAG_RESET DIAG_CLR_EOL "\n");
     fflush(stdout);
@@ -720,9 +783,11 @@ static void tui_print_frag_view(void)
     pct = (c->total > 0) ? (double)c->frag * 100.0 / (double)c->total : 0.0;
 
     printf("Scan path: /" DIAG_CLR_EOL "\n");
-    printf("Scanned: %llu files  Fragmented: %llu (%.1f%%)" DIAG_CLR_EOL "\n\n",
+    printf("Scanned: %llu files  Fragmented: %llu (%.1f%%)  Skipped: %llu"
+           DIAG_CLR_EOL "\n\n",
            (unsigned long long)c->total,
-           (unsigned long long)c->frag, pct);
+           (unsigned long long)c->frag, pct,
+           (unsigned long long)c->skipped);
     printf("Fragmentation distribution:" DIAG_CLR_EOL "\n");
     printf("  %-10s  %s" DIAG_CLR_EOL "\n",   "Extents", "Files");
     printf("  %-10s  %llu" DIAG_CLR_EOL "\n", "1",    (unsigned long long)c->dist[0]);
@@ -732,7 +797,7 @@ static void tui_print_frag_view(void)
 
     if (c->top_count > 0) {
         qsort(c->top, c->top_count, sizeof(c->top[0]), cmp_top_entry);
-        printf("\nTop %d most fragmented:" DIAG_CLR_EOL "\n", c->top_count);
+        printf("\nTop %d files by extent count:" DIAG_CLR_EOL "\n", c->top_count);
         printf("  %7s  %s" DIAG_CLR_EOL "\n", "Extents", "File");
         for (i = 0; i < c->top_count; i++)
             printf("  %7u  %s" DIAG_CLR_EOL "\n",
@@ -745,23 +810,68 @@ static void tui_print_frag_view(void)
 static int tui_read_key(char *out)
 {
     struct pollfd pfd = { STDIN_FILENO, POLLIN, 0 };
+    char c;
     if (safe_poll(&pfd, 1, 0) <= 0) return 0;
-    if (read(STDIN_FILENO, out, 1) <= 0) return 0;
-    *out = (char)toupper((unsigned char)*out);
+    if (read(STDIN_FILENO, &c, 1) <= 0) return 0;
+    if (c == 27) {
+        /* ESC：吞掉後續 escape sequence（方向鍵等 ESC [ X），
+         * 否則左方向鍵 ESC [ D 的 'D' 會被當成 Disk view hotkey */
+        while (safe_poll(&pfd, 1, 0) > 0 && read(STDIN_FILENO, &c, 1) == 1)
+            continue;
+        return 0;
+    }
+    *out = (char)toupper((unsigned char)c);
     return 1;
+}
+
+/* TUI 異常離開的還原機制：
+ * raw mode 一旦開啟，必須在「正常 Q 離開」「Ctrl-C / SIGTERM / SIGHUP」
+ * 「迴圈中 x* allocator die」三種路徑都還原 termios 與游標，
+ * 否則 shell 會卡在 raw mode、游標維持隱藏，需手動 stty sane / reset。 */
+static struct termios     g_tui_saved_termios;
+static volatile sig_atomic_t g_tui_active = 0;
+
+/* 還原 termios 與游標。可能在 signal handler 中執行，
+ * 故僅用 async-signal-safe 的 tcsetattr() 與 write()，不碰 stdio。 */
+static void tui_restore(void)
+{
+    static const char show_cursor[] = DIAG_SHOW;
+    if (!g_tui_active)
+        return;
+    g_tui_active = 0;
+    tcsetattr(STDIN_FILENO, TCSANOW, &g_tui_saved_termios);
+    write(STDOUT_FILENO, show_cursor, sizeof(show_cursor) - 1);
+}
+
+/* atexit hook：涵蓋 BusyBox x* allocator 在迴圈中 die 的情況 */
+static void tui_atexit(void)
+{
+    tui_restore();
+}
+
+/* fatal signal handler：還原後回復預設處置並重發訊號，
+ * 讓行程以正確的 128+signo 狀態結束。 */
+static void tui_sig_handler(int sig)
+{
+    tui_restore();
+    signal(sig, SIG_DFL);
+    raise(sig);
 }
 
 static void show_fs_tui(void)
 {
-    struct termios old_t;
     struct pollfd  pfd = { STDIN_FILENO, POLLIN, 0 };
 
-    if (!isatty(STDOUT_FILENO))
+    /* 同時要求 stdin 與 stdout 為 tty：輸入經 STDIN poll/read，
+     * stdin 被重導時會進 raw mode 卻永遠讀不到鍵，只能 Ctrl-C 脫困 */
+    if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO))
         bb_error_msg_and_die("-s requires a terminal");
 
-    diag_ui_mode_raw(&old_t);
-    printf(DIAG_HIDE);
-    fflush(stdout);
+    diag_ui_mode_raw(&g_tui_saved_termios);
+    g_tui_active = 1;
+    atexit(tui_atexit);
+    bb_signals(BB_FATAL_SIGS, tui_sig_handler);
+    /* 游標隱藏由 diag_ui_mode_raw 負責，不在此重複輸出 DIAG_HIDE */
 
     while (1) {
         char c = 0;
@@ -780,7 +890,8 @@ static void show_fs_tui(void)
         } else {
             tui_refresh_mount_cache();
             fs_entry_t *entries = NULL;
-            int i, n = collect_all_entries(g_tui_mount_cache, &entries);
+            int i, n = collect_dedup_entries(g_tui_mount_cache,
+                                             0, NULL, 0, NULL, &entries);
             print_entries(entries, n, g_tui_human,
                           g_tui_view == FS_VIEW_INODE,
                           g_tui_view == FS_VIEW_RESERVED);
@@ -796,9 +907,9 @@ static void show_fs_tui(void)
     free_mount_list(g_tui_mount_cache);
     g_tui_mount_cache = NULL;
 
-    printf(DIAG_SHOW);
-    fflush(stdout);
-    diag_ui_mode_normal(&old_t);
+    g_tui_active = 0;
+    /* 游標恢復由 diag_ui_mode_normal 負責，不在此重複輸出 DIAG_SHOW */
+    diag_ui_mode_normal(&g_tui_saved_termios);
     printf("\n");
     fflush(stdout);
 }
@@ -818,71 +929,29 @@ int my_fs_main(int argc, char **argv)
     int      has_s    = (opts & (1 << 7));
     argv += optind;
 
-    if (has_f) { print_file_frag(opt_f); return EXIT_SUCCESS; }
-    if (has_F) { print_frag_stat(opt_F); return EXIT_SUCCESS; }
+    /* -f / -F / -s 為互斥的 action mode；同時給多個語意不明，
+     * 明確報 usage error 而非靜默只跑其中一個 */
+    if (!!has_f + !!has_F + !!has_s > 1)
+        bb_show_usage();
+
+    if (has_f) return print_file_frag(opt_f);
+    if (has_F) return print_frag_stat(opt_F);
     if (has_s) { g_tui_human = human; show_fs_tui(); return EXIT_SUCCESS; }
 
     mount_node_t *mounts = get_mount_list();
     fs_entry_t   *entries;
     int           n = 0, i;
+    int           had_error = 0;
 
     if (!argv[0]) {
-        dev_t         seen_dev[256];
-        mount_node_t *seen_node[256];
-        /* 先計算掛載點數量，按實際大小分配（避免 256 × ~8 KB 固定清零） */
-        int           mount_count = 0;
-        mount_node_t *m;
-        for (m = mounts; m; m = m->next) mount_count++;
-        fs_entry_t   *seen_entry = xzalloc((mount_count ? mount_count : 1) * sizeof(fs_entry_t));
-        int           seen_n = 0;
-
-        /* 第一遍：先以 -t/-x 類型過濾，再呼叫 statfs()，
-         * 同時將結果暫存於 seen_entry，消除第二遍重複呼叫 statfs() */
-        for (m = mounts; m; m = m->next) {
-            fs_entry_t  tmp;
-            struct stat sb;
-            memset(&tmp, 0, sizeof(tmp));
-            if (has_t && strcmp(m->fstype, opt_t) != 0) continue;
-            if (has_x && strcmp(m->fstype, opt_x) == 0) continue;
-            if (get_fs_entry(m->mountpoint, &tmp) != 0 || tmp.total_1k == 0) {
-                free_fs_entry(&tmp);
-                continue;
-            }
-            if (stat(m->mountpoint, &sb) != 0) {
-                free_fs_entry(&tmp);
-                continue;
-            }
-            int found = 0;
-            for (i = 0; i < seen_n; i++) {
-                if (seen_dev[i] == sb.st_dev) {
-                    seen_node[i]  = m;
-                    /* 同裝置 bind mount：先釋放舊條目的字串，再轉移 tmp 的擁有權 */
-                    free_fs_entry(&seen_entry[i]);
-                    seen_entry[i] = tmp;
-                    found = 1;
-                    break;
-                }
-            }
-            if (!found && seen_n < 256) {
-                seen_dev[seen_n]   = sb.st_dev;
-                seen_node[seen_n]  = m;
-                seen_entry[seen_n] = tmp;   /* 轉移擁有權 */
-                seen_n++;
-            } else if (!found) {
-                /* 超過 256 個唯一掛載點，丟棄 tmp */
-                free_fs_entry(&tmp);
-            }
+        /* no-arg 模式必須能列舉掛載表；NULL = setmntent 開啟失敗
+         * （Linux /proc/mounts 恆有資料，空清單不視為正常狀況），
+         * 明確回報而非靜默印空表後回 0 */
+        if (!mounts) {
+            bb_perror_msg("%s", bb_path_mtab_file);
+            return EXIT_FAILURE;
         }
-
-        /* 第二遍：轉移 seen_entry 擁有權至 entries，並補上 device/fstype */
-        entries = xzalloc((seen_n ? seen_n : 1) * sizeof(fs_entry_t));
-        for (i = 0; i < seen_n; i++) {
-            entries[n] = seen_entry[i];                  /* shallow copy（轉移字串擁有權） */
-            entries[n].device = xstrdup(seen_node[i]->device);
-            entries[n].fstype = xstrdup(seen_node[i]->fstype);
-            n++;
-        }
-        free(seen_entry);   /* 字串擁有權已轉移至 entries，只釋放陣列 */
+        n = collect_dedup_entries(mounts, has_t, opt_t, has_x, opt_x, &entries);
     } else {
         /* 有參數：對每個路徑收集 fs_entry_t */
         char **arg;
@@ -893,18 +962,34 @@ int my_fs_main(int argc, char **argv)
         for (arg = argv; *arg; arg++) {
             mount_node_t *m, *best = NULL;
             size_t best_len = 0;
+            char *canon;
+            const char *cpath;
 
             if (get_fs_entry(*arg, &entries[n]) != 0) {
                 bb_perror_msg("%s", *arg);
+                had_error = 1;
                 continue;
             }
+            /* 對齊 df：先 realpath 正規化為絕對路徑（解 relative path /
+             * symlink / .. ），再做「邊界感知的最長掛載點前綴」比對。
+             * 邊界檢查避免 /foo 誤吃 /foobar；以最長前綴選最深掛載點，
+             * 在多個 bind mount（同裝置不同 mountpoint）時也能選對。 */
+            canon = xmalloc_realpath(*arg);
+            cpath = canon ? canon : *arg;
             for (m = mounts; m; m = m->next) {
                 size_t len = strlen(m->mountpoint);
-                if (strncmp(*arg, m->mountpoint, len) == 0 && len > best_len) {
+                if (strncmp(cpath, m->mountpoint, len) != 0) continue;
+                /* mountpoint=="/" 時 mountpoint[len-1]=='/' 恆相符；
+                 * 否則要求 cpath 在 len 處為結尾或路徑分隔符 */
+                if (!(m->mountpoint[len - 1] == '/'
+                      || cpath[len] == '\0' || cpath[len] == '/'))
+                    continue;
+                if (!best || len > best_len) {
                     best = m;
                     best_len = len;
                 }
             }
+            free(canon);
             if (best) {
                 if ((has_t && strcmp(best->fstype, opt_t) != 0)
                  || (has_x && strcmp(best->fstype, opt_x) == 0)) {
@@ -913,6 +998,9 @@ int my_fs_main(int argc, char **argv)
                 }
                 entries[n].device = xstrdup(best->device);
                 entries[n].fstype = xstrdup(best->fstype);
+                /* Mounted on 對齊 df：顯示實際掛載點而非使用者輸入字串 */
+                free(entries[n].path);
+                entries[n].path = xstrdup(best->mountpoint);
             } else {
                 entries[n].device = xstrdup(*arg);
             }
@@ -925,5 +1013,5 @@ int my_fs_main(int argc, char **argv)
         free_fs_entry(&entries[i]);
     free(entries);
     free_mount_list(mounts);
-    return EXIT_SUCCESS;
+    return had_error ? EXIT_FAILURE : EXIT_SUCCESS;
 }

@@ -1,5 +1,5 @@
 .\" vi: set sw=4 ts=4:
-.TH MY_FS 1 "2026-05-11" "BusyBox Diagnostic Toolkit" "User Commands"
+.TH MY_FS 1 "2026-05-18" "BusyBox Diagnostic Toolkit" "User Commands"
 .SH NAME
 my_fs \- filesystem health checker: disk usage, inode analysis, and fragmentation
 .SH SYNOPSIS
@@ -10,11 +10,14 @@ my_fs \- filesystem health checker: disk usage, inode analysis, and fragmentatio
 displays disk space usage and health information for one or more filesystems.
 Without path arguments, it reads
 .I /proc/mounts
-and reports all mounted physical filesystems (de-duplicated by
-.IR st_dev ,
-virtual filesystems with
+and reports all mounted filesystems de-duplicated by
+.IR st_dev .
+Filesystems reporting
 .I f_blocks
-== 0 are excluded).
+== 0 (many pseudo-filesystems) are excluded; note that block-backed
+in-memory filesystems such as
+.I tmpfs
+are still listed, so the output is not limited to physical disks.
 .PP
 Core features:
 .IP \(bu 2
@@ -28,14 +31,39 @@ Inode usage analysis compatible with
 Dual-perspective Use% with root-reserved block information (Use%(user) and
 Use%(real) side by side)
 .IP \(bu 2
-Per-file FIEMAP extent analysis compatible with util-linux
+Per-file FIEMAP extent analysis modeled on util-linux
 .BR filefrag (1)
+\fB\-v\fR (extent counts match in common ext4 cases; see
+.B \-f
+below for scope)
 .IP \(bu 2
 Mount-point fragmentation statistics via
 .BR nftw (3)
 traversal with Top-N most fragmented files
 .IP \(bu 2
 Interactive TUI live-monitoring mode
+.PP
+.BR \-f ,
+.BR \-F ,
+and
+.B \-s
+select mutually exclusive action modes; supplying more than one is a usage
+error. When an action mode is given, the disk-usage display options
+.RB ( \-h ,
+.BR \-i ,
+.BR \-r ,
+.BR \-t ,
+.BR \-x )
+and any
+.I PATH
+arguments do not apply (note:
+.B \-s
+honors
+.B \-h
+as the initial human-readable state, and the fragmentation scan in
+.B \-s
+always targets
+.IR / ).
 .SH OPTIONS
 .TP
 .B \-h
@@ -72,10 +100,17 @@ Run a FIEMAP
 .BR ioctl (2)
 on the specified regular file and print all extents with their logical and
 physical offsets and lengths (in filesystem blocks).
-Output format is compatible with
-.BR "filefrag \-v" .
-Filesystems that do not support FIEMAP (e.g.\& tmpfs, overlayfs) produce an
-error message and exit.
+The output is modeled on
+.B "filefrag \-v"
+and the reported extent count matches it in common ext4 cases; exotic layouts
+(sparse files, shared/reflink, inline data, unwritten extents) and the full set
+of extent flags are not guaranteed to match byte-for-byte.
+A symlink argument is not followed
+.RB ( O_NOFOLLOW ),
+unlike
+.BR filefrag .
+Filesystems that do not support FIEMAP (e.g.\& tmpfs, overlayfs, virtiofs)
+print an error message and exit with status 1.
 .TP
 \fB\-F\fR \fIPATH\fR
 Scan all regular files under the given mount point using
