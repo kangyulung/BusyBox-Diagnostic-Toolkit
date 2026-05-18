@@ -849,7 +849,9 @@ static void show_fs_tui(void)
 {
     struct pollfd  pfd = { STDIN_FILENO, POLLIN, 0 };
 
-    if (!isatty(STDOUT_FILENO))
+    /* 同時要求 stdin 與 stdout 為 tty：輸入經 STDIN poll/read，
+     * stdin 被重導時會進 raw mode 卻永遠讀不到鍵，只能 Ctrl-C 脫困 */
+    if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO))
         bb_error_msg_and_die("-s requires a terminal");
 
     diag_ui_mode_raw(&g_tui_saved_termios);
