@@ -438,7 +438,7 @@ static void print_entries(const fs_entry_t *e, int n, int human, int inode, int 
 
 /* ── L1：-f FILE 單檔碎片分析 ── */
 
-static void print_file_frag(const char *path)
+static int print_file_frag(const char *path)
 {
     diag_frag_t f;
     uint64_t blk_size, blocks, expected_phy;
@@ -446,7 +446,7 @@ static void print_file_frag(const char *path)
 
     if (diag_read_fragmentation(path, &f, 1) != 0) {
         bb_perror_msg("%s", path);
-        return;
+        return EXIT_FAILURE;
     }
 
     /* block_size 由 libdiag 從 fstat.st_blksize 帶出，免再呼叫 statfs */
@@ -494,6 +494,7 @@ static void print_file_frag(const char *path)
     printf("%s: %u extent%s found\n", path,
            f.extent_count, f.extent_count == 1 ? "" : "s");
     diag_free_frag(&f);
+    return EXIT_SUCCESS;
 }
 
 /* ── L2：-F PATH 掛載點碎片統計 ── */
@@ -565,14 +566,19 @@ static int cmp_top_entry(const void *a, const void *b)
     return (ea->extents > eb->extents) ? -1 : (ea->extents < eb->extents) ? 1 : 0;
 }
 
-static void print_frag_stat(const char *path)
+static int print_frag_stat(const char *path)
 {
     double frag_pct;
     int i;
 
     memset(&g_l2, 0, sizeof(g_l2));
     printf("Scanning %s ...\n\n", path);
-    nftw(path, l2_nftw_cb, 16, FTW_MOUNT | FTW_PHYS);
+    /* nftw 回傳 -1 表示連 root path 都無法走訪（不存在/無權限等）；
+     * callback 一律回 0，故 0 = 正常走完 */
+    if (nftw(path, l2_nftw_cb, 16, FTW_MOUNT | FTW_PHYS) < 0) {
+        bb_perror_msg("%s", path);
+        return EXIT_FAILURE;
+    }
 
     frag_pct = (g_l2.total > 0)
                ? (double)g_l2.frag * 100.0 / (double)g_l2.total : 0.0;
@@ -594,6 +600,7 @@ static void print_frag_stat(const char *path)
         for (i = 0; i < g_l2.top_count; i++)
             printf("  %7u  %s\n", g_l2.top[i].extents, g_l2.top[i].path);
     }
+    return EXIT_SUCCESS;
 }
 
 /* ── P5：互動式 TUI 模式（-s） ── */
@@ -856,13 +863,14 @@ int my_fs_main(int argc, char **argv)
     int      has_s    = (opts & (1 << 7));
     argv += optind;
 
-    if (has_f) { print_file_frag(opt_f); return EXIT_SUCCESS; }
-    if (has_F) { print_frag_stat(opt_F); return EXIT_SUCCESS; }
+    if (has_f) return print_file_frag(opt_f);
+    if (has_F) return print_frag_stat(opt_F);
     if (has_s) { g_tui_human = human; show_fs_tui(); return EXIT_SUCCESS; }
 
     mount_node_t *mounts = get_mount_list();
     fs_entry_t   *entries;
     int           n = 0, i;
+    int           had_error = 0;
 
     if (!argv[0]) {
         dev_t         seen_dev[256];
@@ -934,6 +942,7 @@ int my_fs_main(int argc, char **argv)
 
             if (get_fs_entry(*arg, &entries[n]) != 0) {
                 bb_perror_msg("%s", *arg);
+                had_error = 1;
                 continue;
             }
             for (m = mounts; m; m = m->next) {
@@ -963,5 +972,5 @@ int my_fs_main(int argc, char **argv)
         free_fs_entry(&entries[i]);
     free(entries);
     free_mount_list(mounts);
-    return EXIT_SUCCESS;
+    return had_error ? EXIT_FAILURE : EXIT_SUCCESS;
 }
