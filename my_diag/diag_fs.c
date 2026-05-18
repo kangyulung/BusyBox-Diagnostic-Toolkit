@@ -30,6 +30,11 @@
 #include <ctype.h>
 #include <signal.h>
 
+/* 游標歸位 + 清螢幕。複用共用標頭的 DIAG_CLR_SCR（僅 "\033[H" 歸位，
+ * 為 my_proc 共用、不可改其語意），再補 "\033[J" 清除至螢幕尾；
+ * 此巨集為 diag_fs.c 私有，避免裸 ANSI 字面值散落各處。 */
+#define MYFS_CLR_SCREEN  DIAG_CLR_SCR "\033[J"
+
 /* 掛載點清單節點（解析自 /proc/mounts）。
  * 三個字串為 xstrdup 配置，由 free_mount_list 釋放；
  * 避免 PATH_MAX 固定陣列導致每節點浪費 ~8 KB 清零成本。 */
@@ -739,7 +744,7 @@ static const char *tui_view_name(void)
 
 static void tui_print_header(void)
 {
-    printf("\033[H\033[J");
+    printf(MYFS_CLR_SCREEN);
     printf(DIAG_CYAN "[MY_FS]" DIAG_RESET
            " View: " DIAG_YELLOW "%s" DIAG_RESET
            "  Human: %s"
@@ -755,7 +760,7 @@ static void tui_print_header(void)
 /* 對 / 執行 nftw 碎片統計，結果存入快取 */
 static void tui_do_frag_scan(void)
 {
-    printf("\033[H\033[J");
+    printf(MYFS_CLR_SCREEN);
     printf(DIAG_YELLOW "Scanning / for fragmentation, please wait..."
            DIAG_RESET DIAG_CLR_EOL "\n");
     fflush(stdout);
