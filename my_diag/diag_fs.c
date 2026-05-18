@@ -908,6 +908,11 @@ int my_fs_main(int argc, char **argv)
     int      has_s    = (opts & (1 << 7));
     argv += optind;
 
+    /* -f / -F / -s 為互斥的 action mode；同時給多個語意不明，
+     * 明確報 usage error 而非靜默只跑其中一個 */
+    if (!!has_f + !!has_F + !!has_s > 1)
+        bb_show_usage();
+
     if (has_f) return print_file_frag(opt_f);
     if (has_F) return print_frag_stat(opt_F);
     if (has_s) { g_tui_human = human; show_fs_tui(); return EXIT_SUCCESS; }
