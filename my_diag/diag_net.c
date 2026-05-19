@@ -1,5 +1,5 @@
 /* vi: set sw=4 ts=4: */
-// clang-format off
+// clang-format on
 //config:config MY_NET
 //config:   bool "my_net (Network Connection Monitor)"
 //config:   default y
@@ -261,6 +261,13 @@ static void parse_ipv6_addr(const char *hex, char *out, size_t outlen)
     snprintf(out, outlen, "[%s]:%u", ip_str, port);
 }
 
+static inline char *skip_token(char *p)
+{
+    while (*p && *p != ' ' && *p != '\n') p++;
+    while (*p == ' ') p++;
+    return p;
+}
+
 static uint32_t parse_hex8(const char *p)
 {
     uint32_t v = 0;
@@ -318,17 +325,13 @@ static int parse_proc_line_raw(const char *line, int is_ipv6,
     *state_out = (int)strtoul(p, &p, 16);
     while (*p == ' ') p++;
 
-    strtoul(p, &p, 16); if (*p == ':') { p++; strtoul(p, &p, 16); }
-    while (*p == ' ') p++;
-    strtoul(p, &p, 16); if (*p == ':') { p++; strtoul(p, &p, 16); }
-    while (*p == ' ') p++;
-    strtoul(p, &p, 16);
-    while (*p == ' ') p++;
+    p = skip_token(p);   /* 跳過 tx_queue:rx_queue */
+    p = skip_token(p);   /* 跳過 tr:tm_when */
+    p = skip_token(p);   /* 跳過 retrnsmt */
 
     *uid_out = (unsigned)strtoul(p, &p, 10);
     while (*p == ' ') p++;
-    strtoul(p, &p, 10);
-    while (*p == ' ') p++;
+    p = skip_token(p);   /* 跳過 timeout */
 
     *inode_out = strtoul(p, &p, 10);
     return 1;
@@ -711,32 +714,81 @@ static void format_ipv6(const uint32_t addr6[4], uint16_t port,
 
 static void print_entry(const net_entry_t *e, int show_pid, int batch)
 {
-    const char *state_str = (strncmp(e->proto, "udp", 3) == 0)
-                            ? "-" : diag_get_tcp_state(e->state);
-    const char *user = diag_uid2uname(e->uid);
-    const char *eol  = batch ? "" : DIAG_CLR_EOL;
+    char line[256];
+    char *p = line;
+    const char *state_str, *user;
     char local[64], remote[64];
+    const char *eol = batch ? "" : DIAG_CLR_EOL;
 
+    /* proto（最多 6 字元，補空白對齊） */
+    int plen = (int)strlen(e->proto);
+    memcpy(p, e->proto, plen);
+    p += plen;
+    /* 補到 7 字元（6 + 1 空格） */
+    while (plen++ < 7) *p++ = ' ';
+
+    /* state（最多 14 字元） */
+    state_str = (strncmp(e->proto, "udp", 3) == 0)
+                ? "-" : diag_get_tcp_state(e->state);
+    int slen = (int)strlen(state_str);
+    memcpy(p, state_str, slen);
+    p += slen;
+    while (slen++ < 15) *p++ = ' ';
+
+    /* local address（最多 42 字元） */
+    int llen;
     if (e->is_ipv6) {
-        format_ipv6(e->laddr6, e->lport, local,  sizeof(local));
-        format_ipv6(e->raddr6, e->rport, remote, sizeof(remote));
+        format_ipv6(e->laddr6, e->lport, local, sizeof(local));
+        llen = (int)strlen(local);
+        memcpy(p, local, llen);
     } else {
-        fast_format_ipv4(local,  e->laddr4, e->lport);   /* 快速格式化 */
-        fast_format_ipv4(remote, e->raddr4, e->rport);
+        llen = fast_format_ipv4(p, e->laddr4, e->lport);
+    }
+    p += llen;
+    while (llen++ < 43) *p++ = ' ';
+
+    /* remote address（最多 42 字元） */
+    int rlen;
+    if (e->is_ipv6) {
+        format_ipv6(e->raddr6, e->rport, remote, sizeof(remote));
+        rlen = (int)strlen(remote);
+        memcpy(p, remote, rlen);
+    } else {
+        rlen = fast_format_ipv4(p, e->raddr4, e->rport);
+    }
+    p += rlen;
+
+    /* PID 欄（只在 show_pid 時輸出） */
+    if (show_pid) {
+        while (rlen++ < 43) *p++ = ' ';
+        if (e->pid > 0) {
+            p += fast_uint(p, (unsigned)e->pid);
+            *p++ = '/';
+            int clen = (int)strlen(e->comm);
+            memcpy(p, e->comm, clen);
+            p += clen;
+            int pid_prog_len = (int)(p - line) - (7 + 15 + 43 + 43);
+            while (pid_prog_len++ < 17) *p++ = ' ';
+        } else {
+            *p++ = '-';
+            int i = 1;
+            while (i++ < 17) *p++ = ' ';
+        }
+    } else {
+        while (rlen++ < 43) *p++ = ' ';
     }
 
-    if (show_pid) {
-        char pid_prog[36];
-        if (e->pid > 0)
-            snprintf(pid_prog, sizeof(pid_prog), "%d/%s", (int)e->pid, e->comm);
-        else
-            safe_strncpy(pid_prog, "-", sizeof(pid_prog));
-        printf("%-6s %-14s %-42s %-42s %-16s %s%s\n",
-               e->proto, state_str, local, remote, pid_prog, user, eol);
-    } else {
-        printf("%-6s %-14s %-42s %-42s %s%s\n",
-               e->proto, state_str, local, remote, user, eol);
-    }
+    /* user */
+    user = diag_uid2uname(e->uid);
+    int ulen = (int)strlen(user);
+    memcpy(p, user, ulen);
+    p += ulen;
+
+    /* eol + newline */
+    if (*eol) { memcpy(p, eol, strlen(eol)); p += strlen(eol); }
+    *p++ = '\n';
+
+    outbuf_write(line, (int)(p - line));
 }
 
 /* TCP 狀態分布摘要 + 異常警告 */
@@ -862,7 +914,6 @@ static void do_scan(int show_tcp, int show_udp,
 
     int printed = 0;
     for (net_entry_t *e = list; e; e = e->next) {
-        if (!entry_visible(e, listen_only, filter_state, state_str)) continue;
         print_entry(e, show_pid, batch);
         printed++;
     }
@@ -873,6 +924,7 @@ static void do_scan(int show_tcp, int show_udp,
 
     if (show_tcp) print_summary(&st, batch);
 
+    outbuf_flush();
     fflush(stdout);
     free_net_list(list);
 }
