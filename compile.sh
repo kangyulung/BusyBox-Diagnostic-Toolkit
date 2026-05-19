@@ -1,4 +1,14 @@
 #!/bin/bash
+# 用法：bash compile.sh [--fmt]
+#   --fmt   編譯前先執行 clang-format 格式化 my_diag/*.c/*.h
+
+DO_FORMAT=0
+for arg in "$@"; do
+    case "$arg" in
+        --fmt) DO_FORMAT=1 ;;
+        *) echo "未知參數：$arg"; exit 1 ;;
+    esac
+done
 
 # 1. 移除自動生成的 Config 與 Kbuild (避免 INSERT 殘留)
 echo "Cleaning up generated config files..."
@@ -8,8 +18,13 @@ rm -f my_diag/Config.in my_diag/Kbuild
 echo "Removing object files in my_diag..."
 #find my_diag -name "*.o" -type f -
 # 先確認清單
-find my_diag -type f ! -name "*.c" ! -name "*.src" ! -name "*.h" ! -name "*.md" ! -name "*.sh" ! -name "*.1" -delete
+find my_diag -type f ! -name "*.c" ! -name "*.src" ! -name "*.h" ! -name "*.md" ! -name "*.sh" ! -name "*.1" ! -name ".clang-format" -delete
 
+
+# 3. 格式化 my_diag 原始碼（需傳入 --fmt 才執行）
+if [ "$DO_FORMAT" -eq 1 ]; then
+    bash "$(dirname "$0")/format.sh"
+fi
 
 echo "Generating build files..."
 #make gen_build_files
