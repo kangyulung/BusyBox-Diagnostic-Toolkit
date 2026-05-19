@@ -1,0 +1,63 @@
+# my_diag/.clang-format
+# 依據 BusyBox 原始碼實際風格
+#   modeline: vi: set sw=4 ts=4:
+#   實證：coreutils/df.c、procps/top.c、procps/ps.c 均以 \t 縮排
+#
+# 此檔案覆蓋根目錄 .clang-format，僅作用於 my_diag/ 目錄。
+
+BasedOnStyle: LLVM
+
+# --- 縮排 ---
+# BusyBox modeline ts=4 sw=4：tab 顯示寬 4、每層縮排一個 tab
+IndentWidth:              4
+TabWidth:                 4
+UseTab:                   Always
+ContinuationIndentWidth:  4
+
+# --- 行寬 ---
+# BusyBox 程式碼行 P99 ≈ 80；usage 字串例外，但不屬於格式化對象
+ColumnLimit: 80
+
+# --- 括號風格（Linux kernel style）---
+# 函式定義：左括號另起一行
+# 控制結構（if/for/while）：左括號留在同行
+BreakBeforeBraces: Linux
+
+# --- 短形式控制 ---
+# BusyBox 不使用單行 if；body 一律另起一行或加括號
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine:        false
+AllowShortFunctionsOnASingleLine:    None
+AllowShortBlocksOnASingleLine:       Never
+
+# --- 指標對齊（Linux/BusyBox 慣例）---
+# int *p;  而非  int* p;
+PointerAlignment:   Right
+ReferenceAlignment: Right
+
+# --- 空格 ---
+SpaceBeforeParens:    ControlStatements
+SpaceAfterCStyleCast: true
+SpacesInParentheses:  false
+SpacesInSquareBrackets: false
+
+# --- 函式參數換行 ---
+# BinPack=false：要嘛全部同行，要嘛各占一行，禁止任意填塞
+BinPackArguments:  false
+BinPackParameters: false
+AllowAllArgumentsOnNextLine:              true
+AllowAllParametersOfDeclarationOnNextLine: true
+
+# --- 對齊 ---
+# BusyBox 手動對齊 enum 成員，clang-format 自動對齊易造成大範圍重排，故關閉
+AlignConsecutiveAssignments:  false
+AlignConsecutiveDeclarations: false
+AlignTrailingComments:        true
+
+# --- Include 排序 ---
+# BusyBox 有固定 include 順序（libbb.h 必須最後），禁止自動排序
+SortIncludes: Never
+
+# --- 其他 ---
+ReflowComments:      false
+MaxEmptyLinesToKeep: 1

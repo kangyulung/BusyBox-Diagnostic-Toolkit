@@ -26,6 +26,7 @@ RUN apt-get update && apt-get install -y \
     bison \
     flex \
     dos2unix \
+    clang-format \
     && rm -rf /var/lib/apt/lists/*
 
 # 移除 Ubuntu minimal 的 man stub 與 dpkg-divert，讓 man-db 裝真正的 binary

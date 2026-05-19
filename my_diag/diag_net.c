@@ -1,4 +1,5 @@
 /* vi: set sw=4 ts=4: */
+// clang-format off
 //config:config MY_NET
 //config:   bool "my_net (Network Connection Monitor)"
 //config:   default y
@@ -25,6 +26,7 @@
 //usage:     "\n	-w SEC		Watch mode: auto-refresh every SEC seconds (Q to quit)"
 //usage:     "\n	-b		Batch mode (plain text output, suitable for scripts)"
 //usage:     "\n	-p		Show PID/program (requires root for all processes)"
+// clang-format on
 
 #include "libbb.h"
 #include "libdiag.h"
