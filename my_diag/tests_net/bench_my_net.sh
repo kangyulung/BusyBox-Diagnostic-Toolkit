@@ -204,8 +204,8 @@ else
     row "UDP       (my_net -u -b  vs  netstat -un)"    "$t_my_u" "$t_ns_u" "ms"
 
     # ── Adjusted ratio section ────────────────────────────────────
-    header "Wall-Clock Time (adjusted, startup subtracted) — \`my_net\` vs \`netstat\`"
     echo ""
+    echo "## Wall-Clock Time (adjusted, startup subtracted) — \`my_net\` vs \`netstat\`"
     echo "> Adjusted = my\_net\_raw − bb\_cat\_overhead (${bb_cat_overhead} ms). Isolates applet logic."
     echo ""
 
@@ -228,7 +228,8 @@ fi
 # Section 2: I/O & Processing Breakdown
 # Isolates /proc file I/O cost from processing cost.
 # ═══════════════════════════════════════════════════════════════════
-header "I/O vs Processing Breakdown"
+echo ""
+echo "I/O vs Processing Breakdown"
 echo ""
 echo "| Component                                    | Time (ms) | Notes"
 echo "|----------------------------------------------|-----------|------"
