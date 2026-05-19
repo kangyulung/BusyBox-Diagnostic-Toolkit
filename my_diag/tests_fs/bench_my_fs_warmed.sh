@@ -130,6 +130,10 @@ warmup_disk() {
         df -h                    >/dev/null 2>&1
         df -i                    >/dev/null 2>&1
         df -t tmpfs              >/dev/null 2>&1
+        $BUSYBOX df              >/dev/null 2>&1
+        $BUSYBOX df /            >/dev/null 2>&1
+        $BUSYBOX df -h           >/dev/null 2>&1
+        $BUSYBOX df -i           >/dev/null 2>&1
     done
     echo "Disk warm-up complete." >&2
 }
@@ -258,6 +262,55 @@ t_ref=$(avg_ms df -t tmpfs)
 mine_app=$(app_ms "$t_mine" "$BB_BASE")
 ref_app=$(app_ms "$t_ref" "$REF_BASE")
 row "my_fs -t tmpfs vs df -t tmpfs" "$t_mine" "$mine_app" "$t_ref" "$ref_app"
+
+# ── Same-framework section (my_fs vs BusyBox df) ──────────────────
+# 兩者都在同一顆 $BUSYBOX 內執行，BusyBox 靜態啟動稅完全相同、在 Total
+# ratio 中相消，故此段 Total ratio 才是權威指標（無架構稅干擾）；App
+# ratio 兩邊同樣以 ./busybox true 為 baseline，僅供連續性參考。
+# BusyBox df 無 -t TYPE 過濾選項，故跳過 -t tmpfs case。
+echo ""
+echo "## Disk Usage — Same Framework (\`my_fs\` vs BusyBox \`df\`)"
+echo ""
+
+if ! $BUSYBOX df / >/dev/null 2>&1; then
+    echo "> Skipped: this build has no BusyBox \`df\` applet (CONFIG_DF disabled)."
+else
+    echo "Both sides run inside the same \`$BUSYBOX\` binary, so the BusyBox startup"
+    echo "tax is identical and cancels in the Total ratio. Here **Total ratio is the"
+    echo "authoritative metric** (no architectural-tax confound): Total > 1.50 means"
+    echo "\`my_fs\` application logic is genuinely slower than BusyBox \`df\`, not a"
+    echo "framework artefact. App columns are baselined against \`./busybox true\`."
+    echo ""
+    print_table_header "bb df"
+
+    # Case 1: single path /
+    t_mine=$(avg_ms $BUSYBOX my_fs /)
+    t_ref=$(avg_ms $BUSYBOX df /)
+    mine_app=$(app_ms "$t_mine" "$BB_BASE")
+    ref_app=$(app_ms "$t_ref" "$BB_BASE")
+    row "my_fs / vs bb df /" "$t_mine" "$mine_app" "$t_ref" "$ref_app"
+
+    # Case 2: all mounts
+    t_mine=$(avg_ms $BUSYBOX my_fs)
+    t_ref=$(avg_ms $BUSYBOX df)
+    mine_app=$(app_ms "$t_mine" "$BB_BASE")
+    ref_app=$(app_ms "$t_ref" "$BB_BASE")
+    row "my_fs (all mounts) vs bb df" "$t_mine" "$mine_app" "$t_ref" "$ref_app"
+
+    # Case 3: -h
+    t_mine=$(avg_ms $BUSYBOX my_fs -h)
+    t_ref=$(avg_ms $BUSYBOX df -h)
+    mine_app=$(app_ms "$t_mine" "$BB_BASE")
+    ref_app=$(app_ms "$t_ref" "$BB_BASE")
+    row "my_fs -h vs bb df -h" "$t_mine" "$mine_app" "$t_ref" "$ref_app"
+
+    # Case 4: -i
+    t_mine=$(avg_ms $BUSYBOX my_fs -i)
+    t_ref=$(avg_ms $BUSYBOX df -i)
+    mine_app=$(app_ms "$t_mine" "$BB_BASE")
+    ref_app=$(app_ms "$t_ref" "$BB_BASE")
+    row "my_fs -i vs bb df -i" "$t_mine" "$mine_app" "$t_ref" "$ref_app"
+fi
 
 # ── FIEMAP section ────────────────────────────────────────────────
 echo ""
