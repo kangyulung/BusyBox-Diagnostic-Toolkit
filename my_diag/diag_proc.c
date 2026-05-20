@@ -331,8 +331,8 @@ static void display_list(proc_node_t *list, proc_node_t **sorted_arr, int cnt)
 	qsort(sorted_arr, cnt, sizeof(proc_node_t *), sort_func);
 	int fixed_width = 6 + 1 + 6 + 1 + 4 + 1 + 10 + 1 + 4 + 1 + 4 + 1 + 10 + 1 +
 					  10 + 1 + 6 + 1 + 6 + 1 + 8 + 1;
-	int comm_width = G.batch_mode ? 0 : (G.width - fixed_width);
-	if (!G.batch_mode && comm_width < 10)
+	int comm_width = G.width - fixed_width;
+	if (comm_width < 10)
 		comm_width = 10;
 	if (G.batch_mode) {
 		printf("PID    PPID   THR  USER       STAT NI   VSZ        RSS        "
@@ -376,8 +376,8 @@ static void display_list(proc_node_t *list, proc_node_t **sorted_arr, int cnt)
 			   cn->cpu_pcnt,
 			   cn->mem_pcnt,
 			   cn->time_str,
-			   comm_width,
-			   comm_width,
+			   G.batch_mode ? 0 : comm_width,
+			   G.batch_mode ? 256 : comm_width,
 			   cn->pinfo->comm,
 			   CLR_EOL);
 	}
