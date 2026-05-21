@@ -2,7 +2,7 @@
 # vi: set sw=4 ts=4:
 # Regression tests for the my_fs applet.
 # Usage: bash test_my_fs.sh [path/to/busybox]
-# Loop device tests (T10-T16) require root privileges.
+# Loop device tests (T11-T17) require root privileges.
 
 BUSYBOX="${1:-./busybox}"
 PASS=0; FAIL=0; SKIP=0
@@ -34,7 +34,7 @@ has_cmd() { command -v "$1" >/dev/null 2>&1; }
 df_col()   { df      "$1" 2>/dev/null | awk -v c="$2" 'NR>1 && NF>=5 {print $c; exit}'; }
 myfs_col() { $BUSYBOX my_fs "$1" 2>/dev/null | awk -v c="$2" 'NR>1 && NF>=5 {print $c; exit}'; }
 
-# inode columns: 2=Inodes 3=IUsed 4=IFree
+# Inode columns: 2=Inodes 3=IUsed 4=IFree
 df_icol()   { df -i      "$1" 2>/dev/null | awk -v c="$2" 'NR>1 && NF>=5 {print $c; exit}'; }
 myfs_icol() { $BUSYBOX my_fs -i "$1" 2>/dev/null | awk -v c="$2" 'NR>1 && NF>=5 {print $c; exit}'; }
 
@@ -46,7 +46,7 @@ within() {
     [ $(( a > b ? a - b : b - a )) -le $tol ]
 }
 
-# ── Preflight ─────────────────────────────────────────────────────
+# Preflight
 echo "=== my_fs regression tests ==="
 printf "busybox : %s\n" "$BUSYBOX"
 printf "date    : %s\n" "$(date)"
@@ -57,7 +57,7 @@ if [ ! -x "$BUSYBOX" ]; then
     exit 1
 fi
 
-# ── Group 1: Capacity comparison on / ────────────────────────────
+# Group 1: Capacity comparison on /
 echo "--- Group 1: Capacity comparison (/) ---"
 
 v1=$(myfs_col / 2); v2=$(df_col / 2)
@@ -80,7 +80,7 @@ else
     fail "T04 -h format : got '$hr'"
 fi
 
-# ── Group 2: Inode mode on / ──────────────────────────────────────
+# Group 2: Inode mode on /
 echo ""
 echo "--- Group 2: Inode mode (/) ---"
 
@@ -92,7 +92,7 @@ v1=$(myfs_icol / 4); v2=$(df_icol / 4)
 if within "$v1" "$v2"; then pass "T06 free_inodes : my_fs=$v1  df=$v2"
 else                        fail "T06 free_inodes : my_fs=$v1  df=$v2"; fi
 
-# ── Group 3: Option flags ─────────────────────────────────────────
+# Group 3: Option flags
 echo ""
 echo "--- Group 3: Option flags ---"
 
@@ -140,7 +140,7 @@ else
     skip "T10 -x tmpfs  : no tmpfs mounts to exclude"
 fi
 
-# ── Group 4: ext4 loop device ────────────────────────────────────
+# Group 4: ext4 loop device
 echo ""
 echo "--- Group 4: ext4 loop device ---"
 
@@ -165,7 +165,7 @@ else
     if within "$v1" "$v2"; then pass "T12 ext4 total_inodes: my_fs=$v1  df=$v2"
     else                        fail "T12 ext4 total_inodes: my_fs=$v1  df=$v2"; fi
 
-    # ext4 reserves 5% by default → RootResv should be > 0
+    # ext4 reserves 5% by default; RootResv should be > 0
     resv=$($BUSYBOX my_fs -r "$LOOP_MNT" 2>/dev/null | \
            awk 'NR>1 && NF>=5 {print $(NF-1)}')
     if echo "$resv" | grep -qE '^[0-9]+$' && [ "$resv" -gt 0 ]; then
@@ -206,7 +206,7 @@ else
     LOOP_DEV=""; LOOP_MNT=""
 fi
 
-# ── Group 5: xfs loop device ─────────────────────────────────────
+# Group 5: xfs loop device
 echo ""
 echo "--- Group 5: xfs loop device ---"
 
@@ -236,7 +236,7 @@ else
     LOOP_DEV=""; LOOP_MNT=""
 fi
 
-# ── Summary ───────────────────────────────────────────────────────
+# Summary
 echo ""
 printf "=== Summary: ${GREEN}PASS=%d${NC}  ${RED}FAIL=%d${NC}  ${YELLOW}SKIP=%d${NC} ===\n" \
     "$PASS" "$FAIL" "$SKIP"

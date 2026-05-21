@@ -32,14 +32,18 @@
 #include <ctype.h>
 #include <signal.h>
 
-/* 游標歸位 + 清螢幕。複用共用標頭的 DIAG_CLR_SCR（僅 "\033[H" 歸位，
- * 為 my_proc 共用、不可改其語意），再補 "\033[J" 清除至螢幕尾；
- * 此巨集為 diag_fs.c 私有，避免裸 ANSI 字面值散落各處。 */
+/* Move the cursor home and clear the screen.
+ * DIAG_CLR_SCR only emits "\033[H" and is shared with my_proc,
+ * so keep its behavior unchanged and append "\033[J" locally.
+ * This macro is private to diag_fs.c to avoid scattering raw ANSI
+ * escape strings across the file. */
 #define MYFS_CLR_SCREEN DIAG_CLR_SCR "\033[J"
 
-/* 掛載點清單節點（解析自 /proc/mounts）。
- * 三個字串為 xstrdup 配置，由 free_mount_list 釋放；
- * 避免 PATH_MAX 固定陣列導致每節點浪費 ~8 KB 清零成本。 */
+/* Mount list node parsed from the mount table.
+ * The three strings are allocated with xstrdup() and freed by
+ * free_mount_list().
+ * This avoids fixed PATH_MAX arrays, which would waste about 8 KB of
+ * zero-fill work per node. */
 typedef struct mount_node {
 	char *device;
 	char *mountpoint;
@@ -47,25 +51,26 @@ typedef struct mount_node {
 	struct mount_node *next;
 } mount_node_t;
 
-/* 單一掛載點的展示用欄位，由 get_fs_entry() 計算填入。
- * 三個字串為 xstrdup 配置，需呼叫 free_fs_entry() 釋放。 */
+/* Display fields for one mounted filesystem, filled by get_fs_entry().
+ * The three strings are allocated with xstrdup() and must be released
+ * with free_fs_entry(). */
 typedef struct {
 	char *device;
 	char *path;
 	char *fstype;
-	/* 容量欄位（預設模式） */
+	/* Block usage fields, used by the default view. */
 	uint64_t total_1k;
 	uint64_t used_1k;
 	uint64_t avail_1k;
-	unsigned use_pct; /* ceiling round-up（user 視角，對齊 df） */
-	/* inode 欄位（-i 模式） */
+	unsigned use_pct; /* Ceiling-rounded, user view, matching df. */
+	/* Inode usage fields, used by -i. */
 	unsigned long total_inodes;
 	unsigned long used_inodes;
 	unsigned long free_inodes;
-	unsigned iuse_pct; /* ceiling round-up */
-	/* 雙視角欄位（-r 模式） */
-	uint64_t rootresv_1k;  /* (f_bfree - f_bavail) × f_frsize / 1024 */
-	unsigned use_pct_real; /* ceiling(used_real / total * 100)，含保留區 */
+	unsigned iuse_pct; /* Ceiling-rounded. */
+	/* Dual-perspective fields, used by -r. */
+	uint64_t rootresv_1k;  /* (f_bfree - f_bavail) * f_frsize / 1024 */
+	unsigned use_pct_real; /* ceiling(used_real / total * 100), including reserved blocks */
 } fs_entry_t;
 
 static void free_fs_entry(fs_entry_t *e)
@@ -80,9 +85,11 @@ static void free_fs_entry(fs_entry_t *e)
 	e->fstype = NULL;
 }
 
-/* 解析掛載表，回傳掛載點清單（linked list，順序與檔案相同）。
- * 使用 setmntent/getmntent 正確處理路徑中的 octal 逸脫（\040 → 空格等）。
- * bb_path_mtab_file 依 BusyBox 編譯設定自動選 /etc/mtab 或 /proc/mounts。 */
+/* Parse the mount table and return a linked list in file order.
+ * Use setmntent()/getmntent() so octal escapes in paths, such as
+ * "\040" for spaces, are decoded correctly.
+ * bb_path_mtab_file selects /etc/mtab or /proc/mounts according to the
+ * BusyBox build configuration. */
 static mount_node_t *get_mount_list(void)
 {
 	FILE *fp;
@@ -120,7 +127,7 @@ static void free_mount_list(mount_node_t *head)
 	}
 }
 
-/* 呼叫 diag_read_fs() 並將原始欄位換算為展示用數值 */
+/* Read raw filesystem data with diag_read_fs() and derive display fields. */
 static int get_fs_entry(const char *path, fs_entry_t *e)
 {
 	diag_fs_t fs;
@@ -136,12 +143,12 @@ static int get_fs_entry(const char *path, fs_entry_t *e)
 	e->total_1k = fs.total_bytes / 1024;
 	e->used_1k = used / 1024;
 	e->avail_1k = avail / 1024;
-	/* ceiling(used / nonr_tot * 100)，與 df 的 Use% 計算一致 */
+	/* ceiling(used / nonr_tot * 100), matching df's Use% calculation */
 	e->use_pct = (nonr_tot > 0)
 					 ? (unsigned) ((used * 100 + nonr_tot - 1) / nonr_tot)
 					 : 0;
 
-	/* inode 欄位 */
+	/* Inode fields. */
 	unsigned long used_in = (fs.total_inodes >= fs.free_inodes)
 								? fs.total_inodes - fs.free_inodes
 								: 0;
@@ -153,7 +160,8 @@ static int get_fs_entry(const char *path, fs_entry_t *e)
 									fs.total_inodes)
 					  : 0;
 
-	/* 雙視角欄位：rootresv_1k = 保留區大小（root 專用），use_pct_real = 含保留區的使用率 */
+	/* Dual-perspective fields: rootresv_1k is reserved space for root,
+	 * and use_pct_real is usage including reserved blocks. */
 	e->rootresv_1k = (fs.free_bytes_priv > fs.free_bytes)
 						 ? (fs.free_bytes_priv - fs.free_bytes) / 1024
 						 : 0;
@@ -171,7 +179,7 @@ static int get_fs_entry(const char *path, fs_entry_t *e)
 	return 0;
 }
 
-/* 計算 uint64 值的十進位字元數 */
+/* Return the number of decimal digits needed for a uint64_t value. */
 static int uint64_width(uint64_t v)
 {
 	int w = 1;
@@ -182,7 +190,8 @@ static int uint64_width(uint64_t v)
 	return w;
 }
 
-/* 將 KB 值換算為 human-readable 字串（K/M/G/T），0 直接印 "0" */
+/* Convert a KiB value to a human-readable string using K/M/G/T units.
+ * Zero is printed as "0". */
 static char *fmt_human(uint64_t kb, char *buf, size_t buflen)
 {
 	static const char units[] = "KMGTPE";
@@ -200,7 +209,7 @@ static char *fmt_human(uint64_t kb, char *buf, size_t buflen)
 		u++;
 	}
 	if (val < 10.0) {
-		/* ceiling（與 val>=10 分支一致，對齊 GNU df -h 行為） */
+			/* Apply ceiling rounding, matching the val >= 10 branch and GNU df -h behavior. */
 		int t = (int) (val * 10.0);
 		if ((double) t < val * 10.0)
 			t++;
@@ -209,7 +218,7 @@ static char *fmt_human(uint64_t kb, char *buf, size_t buflen)
 		else
 			snprintf(buf, buflen, "%d.%d%c", t / 10, t % 10, units[u]);
 	} else {
-		/* ceiling */
+			/* Apply ceiling rounding. */
 		uint64_t c = (uint64_t) val;
 		if ((double) c < val)
 			c++;
@@ -218,7 +227,8 @@ static char *fmt_human(uint64_t kb, char *buf, size_t buflen)
 	return buf;
 }
 
-/* 將原始計數值（非 KB）換算為 human-readable，0 直接印 "0" */
+/* Convert a raw count, not a KiB value, to a human-readable string.
+ * Zero is printed as "0". */
 static char *fmt_human_count(uint64_t n, char *buf, size_t buflen)
 {
 	static const char units[] = "KMGTPE";
@@ -236,7 +246,7 @@ static char *fmt_human_count(uint64_t n, char *buf, size_t buflen)
 	if (u < 0) {
 		snprintf(buf, buflen, "%llu", (unsigned long long) n);
 	} else if (val < 10.0) {
-		/* ceiling（與 val>=10 分支一致，對齊 GNU df -h 行為） */
+			/* Apply ceiling rounding, matching the val >= 10 branch and GNU df -h behavior. */
 		int t = (int) (val * 10.0);
 		if ((double) t < val * 10.0)
 			t++;
@@ -254,19 +264,19 @@ static char *fmt_human_count(uint64_t n, char *buf, size_t buflen)
 }
 
 /*
- * 先掃一遍計算各欄最大寬度，再統一列印。
- * 支援三種輸出模式：
- *   inode=1  → -i inode 視圖
- *   reserved=1 → -r 雙視角 Use% + RootResv
- *   兩者皆 0 → 預設容量視圖（對齊 df）
- * 以上三種均可與 human=1 （-h）搭配。
+ * Scan once to compute maximum column widths, then print all rows.
+ * Three output modes are supported:
+ *   inode=1    -> -i inode view
+ *   reserved=1 -> -r dual Use% + RootResv view
+ *   both zero  -> default block view, matching df
+ * All three modes can be combined with human=1 (-h).
  */
 static void
 print_entries(const fs_entry_t *e, int n, int human, int inode, int reserved)
 {
 	int dev_w, col1_w, col2_w, col3_w, w, i;
 
-	/* ── inode 模式（-i） ── */
+	/* Inode view (-i). */
 	if (inode) {
 		dev_w = (int) strlen("Filesystem");
 		col1_w = (int) strlen("Inodes");
@@ -294,7 +304,9 @@ print_entries(const fs_entry_t *e, int n, int human, int inode, int reserved)
 				if (w > c3_max)
 					c3_max = w;
 			}
-			/* 若 Inodes 表頭比最長資料寬，右對齊本身已提供視覺間距，device 欄不需加 +1（對齊 df 行為） */
+			/* If the Inodes header is wider than the longest data value, right
+			 * alignment already provides the visual spacing, so the device column
+			 * does not need +1 padding. This matches df behavior. */
 			int i1pad = (c1_max < (int) strlen("Inodes")) ? 0 : 1;
 			dev_w = (dev_max + i1pad > (int) strlen("Filesystem"))
 						? dev_max + i1pad
@@ -378,7 +390,7 @@ print_entries(const fs_entry_t *e, int n, int human, int inode, int reserved)
 		return;
 	}
 
-	/* ── 雙視角模式（-r）── */
+	/* Dual-perspective view (-r). */
 	if (reserved) {
 		int resv_w;
 
@@ -506,7 +518,7 @@ print_entries(const fs_entry_t *e, int n, int human, int inode, int reserved)
 		return;
 	}
 
-	/* ── 預設容量模式（對齊 df）── */
+	/* Default block view, matching df. */
 	if (human) {
 		char buf[16];
 		int dev_max = 0, total_max = 0, used_max = 0, avail_max = 0;
@@ -610,7 +622,7 @@ print_entries(const fs_entry_t *e, int n, int human, int inode, int reserved)
 	}
 }
 
-/* ── L1：-f FILE 單檔碎片分析 ── */
+/* L1: single-file fragmentation analysis for -f FILE. */
 
 static int print_file_frag(const char *path)
 {
@@ -623,7 +635,7 @@ static int print_file_frag(const char *path)
 		return EXIT_FAILURE;
 	}
 
-	/* block_size 由 libdiag 從 fstat.st_blksize 帶出，免再呼叫 statfs */
+	/* block_size comes from fstat().st_blksize in libdiag, avoiding another statfs() call. */
 	blk_size = f.block_size > 0 ? (uint64_t) f.block_size : 4096;
 	blocks = (f.file_size + blk_size - 1) / blk_size;
 
@@ -653,7 +665,8 @@ static int print_file_frag(const char *path)
 						 "%llu",
 						 (unsigned long long) expected_phy);
 
-				/* 以逗號連接，避免多旗標時黏成 "last,eofunknown " */
+				/* Join flags with commas so multiple flags do not collapse into strings
+				 * like "last,eofunknown". */
 #define ADD_FLAG(bit, name)                                                    \
 	do {                                                                       \
 		if (e->fe_flags & (bit)) {                                             \
@@ -690,7 +703,7 @@ static int print_file_frag(const char *path)
 	return EXIT_SUCCESS;
 }
 
-/* ── L2：-F PATH 掛載點碎片統計 ── */
+/* L2: mounted-filesystem fragmentation statistics for -F PATH. */
 
 #define L2_TOP_N 10
 
@@ -703,8 +716,8 @@ struct l2_top_entry {
 struct l2_ctx {
 	uint64_t total;
 	uint64_t frag;
-	uint64_t skipped; /* FTW_F 但 FIEMAP 失敗（無權限/不支援）*/
-	uint64_t dist[4]; /* [0]=1, [1]=2-4, [2]=5-16, [3]=17+ */
+	uint64_t skipped; /* FTW_F entries where FIEMAP failed: permission denied or unsupported. */
+	uint64_t dist[4]; /* [0]=1, [1]=2-4, [2]=5-16, [3]=17+ extents */
 	struct l2_top_entry top[L2_TOP_N];
 	int top_count;
 };
@@ -725,8 +738,9 @@ static int l2_nftw_cb(const char *path,
 		return 0;
 
 	if (diag_read_fragmentation(path, &f, 0) != 0) {
-		/* 一般檔案但無法做 FIEMAP（無讀取權限 / fs 不支援），
-         * 計入 skipped 以免 total 與碎片率分母被低估 */
+		/* Regular file, but FIEMAP failed because permission was denied or the
+		 * filesystem does not support it. Count it as skipped so total and the
+		 * fragmentation-rate denominator are not understated. */
 		g_l2.skipped++;
 		return 0;
 	}
@@ -751,7 +765,9 @@ static int l2_nftw_cb(const char *path,
 		g_l2.top[g_l2.top_count].size = f.file_size;
 		g_l2.top_count++;
 	} else {
-		/* 清單已滿：以 extent_count 最小的項目作為替換候選 */
+		/* The top-file list is full; use the entry with the smallest extent_count
+		 * as the replacement candidate. This keeps the N files with the highest
+		 * extent counts. */
 		min_idx = 0;
 		for (i = 1; i < L2_TOP_N; i++) {
 			if (g_l2.top[i].extents < g_l2.top[min_idx].extents)
@@ -783,8 +799,9 @@ static int print_frag_stat(const char *path)
 
 	memset(&g_l2, 0, sizeof(g_l2));
 	printf("Scanning %s ...\n\n", path);
-	/* nftw 回傳 -1 表示連 root path 都無法走訪（不存在/無權限等）；
-     * callback 一律回 0，故 0 = 正常走完 */
+	/* nftw() returns -1 when even the root path cannot be walked, such as
+	 * when it does not exist or permission is denied.
+	 * The callback always returns 0, so 0 means the walk completed normally. */
 	if (nftw(path, l2_nftw_cb, 16, FTW_MOUNT | FTW_PHYS) < 0) {
 		bb_perror_msg("%s", path);
 		return EXIT_FAILURE;
@@ -820,7 +837,7 @@ static int print_frag_stat(const char *path)
 	return EXIT_SUCCESS;
 }
 
-/* ── P5：互動式 TUI 模式（-s） ── */
+/* P5: interactive TUI mode (-s). */
 
 typedef enum {
 	FS_VIEW_DF,
@@ -834,7 +851,8 @@ static int g_tui_human = 0;
 static int g_tui_frag_ready = 0;
 static struct l2_ctx g_tui_frag_cache;
 
-/* 掛載表快取：TTL 內重複使用同一份清單，避免每秒重讀 /proc/mounts */
+/* Mount table cache: reuse the same list within the TTL to avoid reading
+ * /proc/mounts every second. */
 #define MOUNT_CACHE_TTL 10
 static mount_node_t *g_tui_mount_cache = NULL;
 static time_t g_tui_mount_cache_ts = 0;
@@ -845,8 +863,9 @@ static void tui_refresh_mount_cache(void)
 	mount_node_t *fresh;
 	if (g_tui_mount_cache && (now - g_tui_mount_cache_ts) < MOUNT_CACHE_TTL)
 		return;
-	/* 取新清單成功才替換舊的；失敗則保留舊 cache 且不更新 ts，
-     * 下一輪會再重試，避免暫時讀取失敗就把畫面清成空表 */
+	/* Replace the old list only after a fresh list is read successfully.
+	 * On failure, keep the old cache and leave the timestamp unchanged so the
+	 * next refresh retries instead of clearing the TUI to an empty table. */
 	fresh = get_mount_list();
 	if (!fresh)
 		return;
@@ -855,12 +874,18 @@ static void tui_refresh_mount_cache(void)
 	g_tui_mount_cache_ts = now;
 }
 
-/* 掃描 mounts，依 st_dev 去重，回傳 fs_entry_t 陣列。
- * 回傳筆數；*out 需逐筆 free_fs_entry() 後再 free() 陣列。
- * has_t/opt_t、has_x/opt_x 為類型過濾（傳 0/NULL 即不過濾，供 TUI 用）。
- * 採「第一遍即暫存 statfs 結果並轉移字串擁有權」，每唯一掛載點只 statfs 一次；
- * seen 三陣列依 mount 數動態配置，無固定 256 上限。
- * mounts 生命週期由呼叫端管理，此函式不釋放它。 */
+/* Scan mounts, deduplicate by st_dev, and return an fs_entry_t array.
+ * The return value is the number of entries. The caller must call
+ * free_fs_entry() for each element in *out, then free() the array.
+ * has_t/opt_t and has_x/opt_x are filesystem-type filters; pass 0/NULL
+ * to disable filtering, as the TUI does.
+ * statfs is called once per mount entry that passes the type filter
+ * (not once per unique device); for bind-mount duplicates with the
+ * same st_dev, the later entry's statfs result overwrites the earlier
+ * one via free_fs_entry() + ownership transfer, so the last bind mount
+ * wins.
+ * The seen arrays are sized by the mount count, with no fixed 256-entry
+ * limit. mounts is owned by the caller and is not freed here. */
 static int collect_dedup_entries(mount_node_t *mounts,
 								 int has_t,
 								 const char *opt_t,
@@ -874,7 +899,7 @@ static int collect_dedup_entries(mount_node_t *mounts,
 	for (m = mounts; m; m = m->next)
 		mount_count++;
 	if (mount_count == 0)
-		mount_count = 1; /* xzalloc(0) 防呆 */
+		mount_count = 1; /* Avoid xzalloc(0). */
 
 	dev_t *seen_dev = xzalloc(mount_count * sizeof(dev_t));
 	mount_node_t **seen_node = xzalloc(mount_count * sizeof(mount_node_t *));
@@ -900,7 +925,8 @@ static int collect_dedup_entries(mount_node_t *mounts,
 		for (i = 0; i < seen_n; i++) {
 			if (seen_dev[i] == sb.st_dev) {
 				seen_node[i] = m;
-				/* 同裝置 bind mount：先釋放舊條目字串，再轉移 tmp 擁有權 */
+				/* Bind mount on the same device: free the old entry strings before
+				 * transferring ownership of tmp. */
 				free_fs_entry(&seen_entry[i]);
 				seen_entry[i] = tmp;
 				found = 1;
@@ -908,24 +934,25 @@ static int collect_dedup_entries(mount_node_t *mounts,
 			}
 		}
 		if (!found) {
-			/* seen_n 必 < mount_count（每唯一掛載點僅 +1），無需上限檢查 */
+			/* seen_n must be less than mount_count because it increments only once
+			 * per unique st_dev (device), so no extra bounds check is needed. */
 			seen_dev[seen_n] = sb.st_dev;
 			seen_node[seen_n] = m;
-			seen_entry[seen_n] = tmp; /* 轉移擁有權 */
+			seen_entry[seen_n] = tmp; /* Transfer ownership. */
 			seen_n++;
 		}
 	}
 
 	fs_entry_t *entries = xzalloc((seen_n ? seen_n : 1) * sizeof(fs_entry_t));
 	for (i = 0; i < seen_n; i++) {
-		entries[n] = seen_entry[i]; /* 轉移字串擁有權 */
+		entries[n] = seen_entry[i]; /* Transfer string ownership. */
 		entries[n].device = xstrdup(seen_node[i]->device);
 		entries[n].fstype = xstrdup(seen_node[i]->fstype);
 		n++;
 	}
 	free(seen_dev);
 	free(seen_node);
-	free(seen_entry); /* 字串擁有權已轉移至 entries，只釋放陣列 */
+	free(seen_entry); /* Strings were moved into entries; free only the array. */
 	*out = entries;
 	return n;
 }
@@ -959,7 +986,7 @@ static void tui_print_header(void)
 		   "-" DIAG_CLR_EOL "\n");
 }
 
-/* 對 / 執行 nftw 碎片統計，結果存入快取 */
+/* Run nftw() fragmentation statistics on / and store the result in cache. */
 static void tui_do_frag_scan(void)
 {
 	printf(MYFS_CLR_SCREEN);
@@ -1022,7 +1049,8 @@ static void tui_print_frag_view(void)
 	printf("\n  [cached - press F to re-scan]" DIAG_CLR_EOL "\n");
 }
 
-/* 非阻塞讀取一個按鍵（toupper 正規化後存入 *out），回傳 1 有輸入 / 0 無輸入 */
+/* Read one key without blocking. Store the toupper-normalized key in *out.
+ * Return 1 when a key is available, or 0 when there is no input. */
 static int tui_read_key(char *out)
 {
 	struct pollfd pfd = {STDIN_FILENO, POLLIN, 0};
@@ -1032,8 +1060,9 @@ static int tui_read_key(char *out)
 	if (safe_read(STDIN_FILENO, &c, 1) <= 0)
 		return 0;
 	if (c == 27) {
-		/* ESC：吞掉後續 escape sequence（方向鍵等 ESC [ X），
-         * 否則左方向鍵 ESC [ D 的 'D' 會被當成 Disk view hotkey */
+		/* ESC: consume the rest of an escape sequence, such as ESC [ X from arrow
+		 * keys. Otherwise the 'D' in left-arrow ESC [ D would be treated as the
+		 * Disk-view hotkey. */
 		while (safe_poll(&pfd, 1, 0) > 0 && safe_read(STDIN_FILENO, &c, 1) == 1)
 			continue;
 		return 0;
@@ -1042,15 +1071,16 @@ static int tui_read_key(char *out)
 	return 1;
 }
 
-/* TUI 異常離開的還原機制：
- * raw mode 一旦開啟，必須在「正常 Q 離開」「Ctrl-C / SIGTERM / SIGHUP」
- * 「迴圈中 x* allocator die」三種路徑都還原 termios 與游標，
- * 否則 shell 會卡在 raw mode、游標維持隱藏，需手動 stty sane / reset。 */
+/* TUI cleanup for abnormal exits.
+ * Once raw mode is enabled, termios and the cursor must be restored on all
+ * exit paths: normal Q exit, Ctrl-C/SIGTERM/SIGHUP, and BusyBox x* allocator
+ * failures inside the loop. Otherwise the shell can remain in raw mode with
+ * the cursor hidden, requiring manual stty sane or reset. */
 static struct termios g_tui_saved_termios;
 static volatile sig_atomic_t g_tui_active = 0;
 
-/* 還原 termios 與游標。可能在 signal handler 中執行，
- * 故僅用 async-signal-safe 的 tcsetattr() 與 write()，不碰 stdio。 */
+/* Restore termios and the cursor. This may run in a signal handler, so use
+ * only async-signal-safe tcsetattr() and write(), and avoid stdio. */
 static void tui_restore(void)
 {
 	static const char show_cursor[] = DIAG_SHOW;
@@ -1061,14 +1091,15 @@ static void tui_restore(void)
 	write(STDOUT_FILENO, show_cursor, sizeof(show_cursor) - 1);
 }
 
-/* atexit hook：涵蓋 BusyBox x* allocator 在迴圈中 die 的情況 */
+/* atexit hook covering BusyBox x* allocator failures inside the loop. */
 static void tui_atexit(void)
 {
 	tui_restore();
 }
 
-/* fatal signal handler：還原後回復預設處置並重發訊號，
- * 讓行程以正確的 128+signo 狀態結束。 */
+/* Fatal signal handler: restore the terminal, reset the default disposition,
+ * and re-raise the signal so the process exits with the correct 128+signo
+ * status. */
 static void tui_sig_handler(int sig)
 {
 	tui_restore();
@@ -1080,8 +1111,9 @@ static void show_fs_tui(void)
 {
 	struct pollfd pfd = {STDIN_FILENO, POLLIN, 0};
 
-	/* 同時要求 stdin 與 stdout 為 tty：輸入經 STDIN poll/read，
-     * stdin 被重導時會進 raw mode 卻永遠讀不到鍵，只能 Ctrl-C 脫困 */
+	/* Require both stdin and stdout to be ttys. Input is read through
+	 * STDIN poll/read; if stdin is redirected, raw mode would be entered but no
+	 * key could be read, leaving Ctrl-C as the only escape. */
 	if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO))
 		bb_error_msg_and_die("-s requires a terminal");
 
@@ -1089,7 +1121,7 @@ static void show_fs_tui(void)
 	g_tui_active = 1;
 	atexit(tui_atexit);
 	bb_signals(BB_FATAL_SIGS, tui_sig_handler);
-	/* 游標隱藏由 diag_ui_mode_raw 負責，不在此重複輸出 DIAG_HIDE */
+	/* diag_ui_mode_raw() hides the cursor, so do not emit DIAG_HIDE here. */
 
 	while (1) {
 		char c = 0;
@@ -1135,7 +1167,7 @@ static void show_fs_tui(void)
 	g_tui_mount_cache = NULL;
 
 	g_tui_active = 0;
-	/* 游標恢復由 diag_ui_mode_normal 負責，不在此重複輸出 DIAG_SHOW */
+	/* diag_ui_mode_normal() restores the cursor, so do not emit DIAG_SHOW here. */
 	diag_ui_mode_normal(&g_tui_saved_termios);
 	printf("\n");
 	fflush(stdout);
@@ -1157,8 +1189,8 @@ int my_fs_main(int argc, char **argv)
 	int has_s = (opts & (1 << 7));
 	argv += optind;
 
-	/* -f / -F / -s 為互斥的 action mode；同時給多個語意不明，
-     * 明確報 usage error 而非靜默只跑其中一個 */
+	/* -f, -F, and -s are mutually exclusive action modes. Combining them is
+	 * ambiguous, so report a usage error instead of silently choosing one. */
 	if (!!has_f + !!has_F + !!has_s > 1)
 		bb_show_usage();
 
@@ -1178,16 +1210,18 @@ int my_fs_main(int argc, char **argv)
 	int had_error = 0;
 
 	if (!argv[0]) {
-		/* no-arg 模式必須能列舉掛載表；NULL = setmntent 開啟失敗
-         * （Linux /proc/mounts 恆有資料，空清單不視為正常狀況），
-         * 明確回報而非靜默印空表後回 0 */
+			/* No-argument mode must be able to enumerate the mount table.
+			 * NULL means either setmntent() failed or the mount table is empty;
+			 * both are abnormal on Linux because /proc/mounts should always have
+			 * entries. Report the error explicitly instead of printing an empty
+			 * table and returning 0. */
 		if (!mounts) {
 			bb_perror_msg("%s", bb_path_mtab_file);
 			return EXIT_FAILURE;
 		}
 		n = collect_dedup_entries(mounts, has_t, opt_t, has_x, opt_x, &entries);
 	} else {
-		/* 有參數：對每個路徑收集 fs_entry_t */
+			/* Arguments were provided: collect one fs_entry_t for each path. */
 		char **arg;
 		int argc_n = 0;
 		for (arg = argv; *arg; arg++)
@@ -1205,18 +1239,20 @@ int my_fs_main(int argc, char **argv)
 				had_error = 1;
 				continue;
 			}
-			/* 對齊 df：先 realpath 正規化為絕對路徑（解 relative path /
-             * symlink / .. ），再做「邊界感知的最長掛載點前綴」比對。
-             * 邊界檢查避免 /foo 誤吃 /foobar；以最長前綴選最深掛載點，
-             * 在多個 bind mount（同裝置不同 mountpoint）時也能選對。 */
+				/* Match df behavior: first canonicalize the path with realpath,
+				 * resolving relative paths, symlinks, and "..", then choose the
+				 * longest mountpoint prefix with boundary checks.
+				 * The boundary check prevents /foo from matching /foobar. The
+				 * longest prefix selects the deepest mountpoint, which also handles
+				 * multiple bind mounts on the same device but different mountpoints. */
 			canon = xmalloc_realpath(*arg);
 			cpath = canon ? canon : *arg;
 			for (m = mounts; m; m = m->next) {
 				size_t len = strlen(m->mountpoint);
 				if (strncmp(cpath, m->mountpoint, len) != 0)
 					continue;
-				/* mountpoint=="/" 時 mountpoint[len-1]=='/' 恆相符；
-                 * 否則要求 cpath 在 len 處為結尾或路徑分隔符 */
+				/* For mountpoint "/", mountpoint[len - 1] == '/' always matches.
+				 * Otherwise cpath must end at len or have a path separator there. */
 				if (!(m->mountpoint[len - 1] == '/' || cpath[len] == '\0' ||
 					  cpath[len] == '/'))
 					continue;
@@ -1229,12 +1265,13 @@ int my_fs_main(int argc, char **argv)
 			if (best) {
 				if ((has_t && strcmp(best->fstype, opt_t) != 0) ||
 					(has_x && strcmp(best->fstype, opt_x) == 0)) {
-					free_fs_entry(&entries[n]); /* 過濾掉時釋放已配置的 path */
+					free_fs_entry(&entries[n]); /* Free the already allocated path when filtered out. */
 					continue;
 				}
 				entries[n].device = xstrdup(best->device);
 				entries[n].fstype = xstrdup(best->fstype);
-				/* Mounted on 對齊 df：顯示實際掛載點而非使用者輸入字串 */
+				/* Match df's "Mounted on" column: show the actual mountpoint instead of
+				 * the user-provided path. */
 				free(entries[n].path);
 				entries[n].path = xstrdup(best->mountpoint);
 			} else {
