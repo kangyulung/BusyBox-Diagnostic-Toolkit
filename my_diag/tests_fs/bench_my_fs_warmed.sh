@@ -14,7 +14,8 @@
 # where the first-measured `./busybox true` baseline ran cooler than the
 # later-measured my_fs cases (causing my_fs app-time to appear negative).
 #
-# Trade-off: this script takes ~3× longer than (deprecated)bench_my_fs.sh (~10–15 s total).
+# Trade-off: this script takes about 3x longer than (deprecated)bench_my_fs.sh
+# (about 10-15 s total).
 #
 # Usage: bash bench_my_fs_warmed.sh [path/to/busybox]
 # Output: Markdown table to stdout.
@@ -57,13 +58,13 @@ avg_ms() {
         awk -v n="$MEDIAN_OF" 'NR == int(n/2)+1 { print }'
 }
 
-# Compute application-layer time (total − startup baseline).
+# Compute application-layer time (total - startup baseline).
 app_ms() {
     local total=$1 base=$2
     awk "BEGIN { printf \"%.2f\", $total - $base }"
 }
 
-# Three-tier status symbol:
+# Status symbol (four tiers):
 #   (none)  Total ≤ 1.50 — proposal target met
 #   ℹ       Total > 1.50 but App ≤ 1.50 — architectural (BusyBox startup tax)
 #   ⚠?      Total > 1.50 and App at or below noise floor — cannot decide
@@ -104,7 +105,7 @@ print_table_header() {
         "$(printf '%7s' '' | tr ' ' '-')"
 }
 
-# ── Warm-up ───────────────────────────────────────────────────────
+# Warm-up
 warmup_disk() {
     echo "Warming up CPU and page cache for disk-usage cases..." >&2
 
@@ -148,17 +149,20 @@ warmup_frag() {
     done
 }
 
-# 製造碎片化測試檔：
-#   1. 用 cp 把 filesystem 填到接近上限（spacer 連續分配）
-#   2. 刪掉偶數索引 spacer → 奇數 spacer 之間出現孤立 4 KB 空洞
-#   3. 寫目標檔：allocator 在找不到 2 個連續 block 的情況下，
-#      每個 4 KB chunk 各自落入不同空洞，產生大量獨立 extent
+# Create a fragmented test file:
+#   1. Fill the filesystem close to capacity with sequentially allocated spacers.
+#   2. Delete even-indexed spacers so isolated 4 KB holes remain between the
+#      odd-indexed spacers.
+#   3. Write the target file. When the allocator cannot find two contiguous
+#      blocks, each 4 KB chunk lands in a separate hole, producing many
+#      independent extents.
 create_frag_file() {
     local mnt=$1
     local target="$mnt/frag_target"
     local i n
 
-    # 建一個 4 KB 的零內容樣板檔，再用 cp 大量複製（避免每次都 fork dd）
+    # Create one 4 KB zero-filled template, then copy it repeatedly to avoid
+    # forking dd for every spacer.
     dd if=/dev/zero of="$mnt/_z" bs=4k count=1 status=none
     printf "  Filling filesystem with 4 KB spacers..." >&2
     i=0
@@ -170,7 +174,8 @@ create_frag_file() {
     sync
     printf " %d files.\n" "$n" >&2
 
-    # 刪掉偶數索引 spacer → 每個偶數 block 變空洞，被奇數 spacer 隔開
+    # Delete even-indexed spacers so each even block becomes a hole separated by
+    # odd-indexed spacers.
     printf "  Freeing alternating spacers..." >&2
     for i in $(seq 0 2 $((n-1))); do
         rm -f "$mnt/sp_$i"
@@ -178,7 +183,8 @@ create_frag_file() {
     sync
     printf " done.\n" >&2
 
-    # 寫目標檔：每 4 KB chunk 被迫獨佔一個孤立空洞 → 獨立 extent
+    # Write the target file so each 4 KB chunk is forced into an isolated hole,
+    # producing separate extents.
     local chunks=$(( n / 4 ))
     [ "$chunks" -gt 200 ] && chunks=200
     printf "  Writing %d-chunk fragmented target..." "$chunks" >&2
@@ -189,7 +195,7 @@ create_frag_file() {
     printf " %s extents.\n" "$extents" >&2
 }
 
-# ── Header ────────────────────────────────────────────────────────
+# Header
 echo "# my_fs Performance Benchmark (warmed)"
 echo ""
 printf -- "- Date: %s\n" "$(date)"
@@ -201,7 +207,7 @@ echo ""
 
 warmup_disk
 
-# ── Startup baselines ─────────────────────────────────────────────
+# Startup baselines
 SHELL_BASE=$(avg_ms true)
 BB_BASE=$(avg_ms $BUSYBOX true)
 REF_BASE=$(avg_ms /bin/true)
@@ -214,7 +220,7 @@ printf -- "- Dynamic-linked binary (\`/bin/true\`): **%s ms/iter**  — baseline
 printf -- "- BusyBox static binary (\`./busybox true\`): **%s ms/iter**  — baseline for \`my_fs\`\n" "$BB_BASE"
 printf -- "- Fixed architectural overhead (static − dynamic): **%s ms/iter**\n" "$ARCH_OVERHEAD"
 echo ""
-echo "App time = total − startup baseline.  \"—\" means at or below the noise floor (app ≤ 0, or for fragmentation cases ref_app < ${MIN_APP_MS} ms)."
+echo "App time = total − startup baseline.  \"—\" means my_fs app ≤ 0 or ref app ≤ noise floor (noise floor = 0 ms for disk cases, ${MIN_APP_MS} ms for fragmentation cases)."
 echo "Ratio = my_fs / reference tool.  Goal: Total Ratio ≤ 1.50 (within 50%)."
 echo ""
 echo "Status legend (appears after each row):"
@@ -263,11 +269,13 @@ mine_app=$(app_ms "$t_mine" "$BB_BASE")
 ref_app=$(app_ms "$t_ref" "$REF_BASE")
 row "my_fs -t tmpfs vs df -t tmpfs" "$t_mine" "$mine_app" "$t_ref" "$ref_app"
 
-# ── Same-framework section (my_fs vs BusyBox df) ──────────────────
-# 兩者都在同一顆 $BUSYBOX 內執行，BusyBox 靜態啟動稅完全相同、在 Total
-# ratio 中相消，故此段 Total ratio 才是權威指標（無架構稅干擾）；App
-# ratio 兩邊同樣以 ./busybox true 為 baseline，僅供連續性參考。
-# BusyBox df 無 -t TYPE 過濾選項，故跳過 -t tmpfs case。
+# Same-framework section (my_fs vs BusyBox df)
+# Both sides run inside the same $BUSYBOX binary, so the BusyBox static
+# startup tax is identical and cancels out in the Total ratio.
+# Therefore this section's Total ratio is the authoritative metric, without
+# architectural-startup-tax interference. The App ratio uses ./busybox true as
+# the baseline on both sides and is kept only for continuity.
+# BusyBox df has no -t TYPE filter, so the -t tmpfs case is skipped.
 echo ""
 echo "## Disk Usage — Same Framework (\`my_fs\` vs BusyBox \`df\`)"
 echo ""
@@ -312,7 +320,7 @@ else
     row "my_fs -i vs bb df -i" "$t_mine" "$mine_app" "$t_ref" "$ref_app"
 fi
 
-# ── FIEMAP section ────────────────────────────────────────────────
+# FIEMAP section
 echo ""
 echo "## Fragmentation Analysis (\`my_fs -f\` vs \`filefrag\`)"
 echo ""
