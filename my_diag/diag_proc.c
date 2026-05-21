@@ -34,8 +34,8 @@
 typedef struct proc_node {
 	diag_node_base_t base;
 	procps_status_t *pinfo;
-	double cpu_pcnt;
-	double mem_pcnt;
+	unsigned cpu_pcnt_10;
+	unsigned mem_pcnt_10;
 	char time_str[16];
 } proc_node_t;
 
@@ -97,12 +97,14 @@ static const char *get_sort_label(void)
 
 static int sort_func(const void *a, const void *b)
 {
-	procps_status_t *pa = (*(proc_node_t **) a)->pinfo;
-	procps_status_t *pb = (*(proc_node_t **) b)->pinfo;
+	proc_node_t *na = *(proc_node_t **) a;
+	proc_node_t *nb = *(proc_node_t **) b;
+	procps_status_t *pa = na->pinfo;
+	procps_status_t *pb = nb->pinfo;
 	int res = 0;
 	switch (G.sort_mode) {
 	case 'P':
-		res = SAFE_COMPARE(pb->utime + pb->stime, pa->utime + pa->stime);
+		res = SAFE_COMPARE(nb->cpu_pcnt_10, na->cpu_pcnt_10);
 		break;
 	case 'M':
 		res = SAFE_COMPARE(pb->rss, pa->rss);
@@ -121,7 +123,7 @@ static int sort_func(const void *a, const void *b)
 		break;
 	case 'S':
 		res = SAFE_COMPARE(pa->state[0], pb->state[0]);
-		break; // 修正：直接比較字元
+		break;
 	case 'C':
 		res = strcmp(pa->comm, pb->comm);
 		break;
@@ -161,13 +163,13 @@ static void print_tree_rich(proc_node_t *curr, int indent, uint64_t mask)
 			printf((mask & (1ULL << i)) ? "│   " : "    ");
 
 		printf(has_sibling ? "├── " : "└── ");
-		printf("%-6d %-15.15s [%c] %8s %5.1f%% %5.1f%% %8s%s\n",
+		printf("%-6d %-15.15s [%c] %8s %3u.%1u%% %3u.%1u%% %8s%s\n",
 			   curr->pinfo->pid,
 			   curr->pinfo->comm,
 			   curr->pinfo->state[0],
 			   make_human_readable_str(curr->pinfo->rss * 1024ULL, 1, 0),
-			   curr->cpu_pcnt,
-			   curr->mem_pcnt,
+			   curr->cpu_pcnt_10 / 10, curr->cpu_pcnt_10 % 10,
+			   curr->mem_pcnt_10 / 10, curr->mem_pcnt_10 % 10,
 			   curr->time_str,
 			   CLR_EOL);
 
@@ -197,8 +199,8 @@ static proc_node_t *fetch_proc_list(void)
 		if (G.target_pid > 0 && p->pid != G.target_pid)
 			continue;
 
-		proc_node_t *n = xzalloc(sizeof(*n));
-		n->pinfo = xmalloc(sizeof(*p));
+		proc_node_t *n = xzalloc(sizeof(*n) + sizeof(*p));
+		n->pinfo = (procps_status_t *)(n + 1);
 		memcpy(n->pinfo, p, sizeof(*p));
 		n->base.next = (diag_node_base_t *) list;
 		list = n;
@@ -211,7 +213,6 @@ static void free_proc_list(proc_node_t *head)
 	while (head) {
 		proc_node_t *tmp = head;
 		head = (proc_node_t *) head->base.next;
-		free(tmp->pinfo);
 		free(tmp);
 	}
 }
@@ -248,16 +249,16 @@ static bool handle_input(struct termios *old_t)
 	struct pollfd pfd = {STDIN_FILENO, POLLIN, 0};
 	char c;
 
-	if (G.batch_mode || poll(&pfd, 1, 0) <= 0)
+	if (G.batch_mode || safe_poll(&pfd, 1, 0) <= 0)
 		return true;
-	if (read(STDIN_FILENO, &c, 1) <= 0)
+	if (safe_read(STDIN_FILENO, &c, 1) <= 0)
 		return true;
 	c = toupper(c);
 	if (c == 'Q')
 		return false;
 	if (c == 'T') {
 		G.view_mode = (G.view_mode == VIEW_TREE) ? VIEW_TOP : VIEW_TREE;
-		printf("\033[2J");
+		printf("\033[H\033[J");
 	} else if (strchr("PMIVOUSC", c)) {
 		G.sort_mode = c;
 	} else if (c == 'K') {
@@ -265,7 +266,7 @@ static bool handle_input(struct termios *old_t)
 			diag_ui_ask_int("Enter PID to kill (0 to cancel): ", old_t);
 		if (pid_to_kill > 0) {
 			if (kill(pid_to_kill, SIGTERM) == 0)
-				sleep(1);
+				sleep1();
 			else
 				bb_perror_msg("kill failed");
 		}
@@ -280,18 +281,19 @@ static void prepare_display_data(proc_node_t *head,
 								 unsigned long total_mem)
 {
 	for (proc_node_t *n = head; n; n = (proc_node_t *) n->base.next) {
-		n->cpu_pcnt = 0.0;
+		n->cpu_pcnt_10 = 0;
 		if (prev_arr && diff > 0) {
 			proc_node_t *p =
 				find_node_by_pid(prev_arr, prev_cnt, n->pinfo->pid);
 			if (p) {
-				unsigned long ticks = (n->pinfo->utime + n->pinfo->stime) -
-									  (p->pinfo->utime + p->pinfo->stime);
-				n->cpu_pcnt = (double) ticks * 100.0 / diff;
+				long ticks = (long)((n->pinfo->utime + n->pinfo->stime) -
+									(p->pinfo->utime + p->pinfo->stime));
+				if (ticks > 0)
+					n->cpu_pcnt_10 = (unsigned) ((ticks * 1000ULL) / diff);
 			}
 		}
-		n->mem_pcnt =
-			(total_mem > 0) ? (n->pinfo->rss * 100.0 / total_mem) : 0.0;
+		n->mem_pcnt_10 =
+			(total_mem > 0) ? (unsigned) ((n->pinfo->rss * 1000ULL) / total_mem) : 0;
 		diag_format_time(n->time_str, n->pinfo->utime, n->pinfo->stime);
 	}
 }
@@ -338,7 +340,7 @@ static void display_list(proc_node_t *list, proc_node_t **sorted_arr, int cnt)
 		printf("PID    PPID   THR  USER       STAT NI   VSZ        RSS        "
 			   "%%CPU   %%MEM   TIME     COMMAND\n");
 	} else {
-		printf("%-6s %-6s %-4s %-10s %-4s %-4s %-10s %-10s %-6s %-6s %-8s "
+			printf("%-6s %-6s %-4s %-10s %-4s %-4s %-10s %-10s %-6s %-6s %-8s "
 			   "%-*.*s%s\n",
 			   "PID",
 			   "PPID",
@@ -362,8 +364,8 @@ static void display_list(proc_node_t *list, proc_node_t **sorted_arr, int cnt)
 		if (!G.batch_mode && i >= (G.height - 6))
 			break;
 		proc_node_t *cn = sorted_arr[i];
-		const char *user = uid2uname(cn->pinfo->uid);
-		printf("%-6d %-6d %-4d %-10.10s %-4c %-4d %-10s %-10s %-6.1f %-6.1f "
+		const char *user = get_cached_username(cn->pinfo->uid);
+		printf("%-6d %-6d %-4d %-10.10s %-4c %-4d %-10s %-10s %4u.%1u %4u.%1u "
 			   "%-8s %-*.*s%s\n",
 			   cn->pinfo->pid,
 			   cn->pinfo->ppid,
@@ -373,8 +375,8 @@ static void display_list(proc_node_t *list, proc_node_t **sorted_arr, int cnt)
 			   cn->pinfo->niceness,
 			   make_human_readable_str(cn->pinfo->vsz * 1024ULL, 1, 0),
 			   make_human_readable_str(cn->pinfo->rss * 1024ULL, 1, 0),
-			   cn->cpu_pcnt,
-			   cn->mem_pcnt,
+			   cn->cpu_pcnt_10 / 10, cn->cpu_pcnt_10 % 10,
+			   cn->mem_pcnt_10 / 10, cn->mem_pcnt_10 % 10,
 			   cn->time_str,
 			   G.batch_mode ? 0 : comm_width,
 			   G.batch_mode ? 256 : comm_width,
@@ -411,8 +413,8 @@ static void show_top_with_cpu(void)
 		proc_node_t **curr_sort_arr = (proc_node_t **) diag_nodes_to_array(
 			(diag_node_base_t *) curr_list, &curr_cnt);
 
-		if (curr_sort_arr && prev_sort_arr && diff > 0) {
-			qsort(curr_sort_arr, curr_cnt, sizeof(proc_node_t *), sort_by_pid);
+		if (prev_sort_arr && diff > 0) {
+			qsort(prev_sort_arr, prev_cnt, sizeof(proc_node_t *), sort_by_pid);
 		}
 
 		if (!handle_input(&old_t)) {
@@ -454,7 +456,7 @@ static void show_top_with_cpu(void)
 			break;
 
 		struct pollfd pfd = {STDIN_FILENO, POLLIN, 0};
-		poll(&pfd, 1, (int) (G.delay * 1000));
+		safe_poll(&pfd, 1, (int) (G.delay * 1000));
 	}
 
 	if (!G.batch_mode) {
@@ -467,6 +469,7 @@ static void show_top_with_cpu(void)
 int my_proc_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
 int my_proc_main(int argc, char **argv)
 {
+	setvbuf(stdout, NULL, _IOFBF, 65536);
 	char *delay_str = NULL;
 	int iterations = -1;
 	int pid = -1;
