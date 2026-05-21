@@ -50,7 +50,7 @@ avg_ms() {
 # ── Helper: total syscall count (single run) ──────────────────────
 syscall_count() {
     local cnt
-    cnt=$(strace -c "$@" >/dev/null 2>&1 | awk '/total/ {print $NF}' | tr -dc '0-9')
+    cnt=$(strace -c "$@" 2>&1 >/dev/null | awk '/total/ {print $NF}' | tr -dc '0-9')
     if [ -z "$cnt" ]; then
         cnt=$(strace "$@" 2>&1 >/dev/null | wc -l)
     fi

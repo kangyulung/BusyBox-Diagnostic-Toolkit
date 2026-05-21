@@ -37,6 +37,24 @@ if [ ! -x "$BUSYBOX" ]; then
     exit 1
 fi
 
+# ── Dummy Network Services (for testing in clean environments) ────
+DUMMY_PIDS=""
+cleanup() {
+    if [ -n "$DUMMY_PIDS" ]; then
+        kill $DUMMY_PIDS >/dev/null 2>&1 || true
+    fi
+}
+trap cleanup EXIT
+
+if has_cmd nc; then
+    echo "Starting dummy network sockets (TCP:58080, UDP:58081)..."
+    nc -l -p 58080 >/dev/null 2>&1 &
+    DUMMY_PIDS="$DUMMY_PIDS $!"
+    nc -u -l -p 58081 >/dev/null 2>&1 &
+    DUMMY_PIDS="$DUMMY_PIDS $!"
+    sleep 0.5 # Give sockets time to bind
+fi
+
 # ── Group 1: Basic output sanity ──────────────────────────────────
 echo "--- Group 1: Basic output sanity ---"
 
