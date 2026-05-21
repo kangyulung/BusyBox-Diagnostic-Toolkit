@@ -1029,12 +1029,12 @@ static int tui_read_key(char *out)
 	char c;
 	if (safe_poll(&pfd, 1, 0) <= 0)
 		return 0;
-	if (read(STDIN_FILENO, &c, 1) <= 0)
+	if (safe_read(STDIN_FILENO, &c, 1) <= 0)
 		return 0;
 	if (c == 27) {
 		/* ESC：吞掉後續 escape sequence（方向鍵等 ESC [ X），
          * 否則左方向鍵 ESC [ D 的 'D' 會被當成 Disk view hotkey */
-		while (safe_poll(&pfd, 1, 0) > 0 && read(STDIN_FILENO, &c, 1) == 1)
+		while (safe_poll(&pfd, 1, 0) > 0 && safe_read(STDIN_FILENO, &c, 1) == 1)
 			continue;
 		return 0;
 	}
