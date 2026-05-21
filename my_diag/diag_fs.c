@@ -745,9 +745,15 @@ static int l2_nftw_cb(const char *path,
 		return 0;
 	}
 
+	/* Skip empty files: 0 extents means no data is on disk, so there is no
+	 * fragmentation to report. Without this guard, empty files would land in
+	 * dist[0] (the "1 extent" bucket), inflating both total and dist[0]. */
+	if (f.extent_count == 0)
+		return 0;
+
 	g_l2.total++;
 
-	if (f.extent_count <= 1)
+	if (f.extent_count == 1)
 		g_l2.dist[0]++;
 	else if (f.extent_count <= 4)
 		g_l2.dist[1]++;
