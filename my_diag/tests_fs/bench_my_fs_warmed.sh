@@ -14,8 +14,9 @@
 # where the first-measured `./busybox true` baseline ran cooler than the
 # later-measured my_fs cases (causing my_fs app-time to appear negative).
 #
-# Trade-off: this script takes about 3x longer than (deprecated)bench_my_fs.sh
-# (about 10-15 s total).
+# Trade-off: this script takes notably longer than (deprecated)bench_my_fs.sh
+# (about 25-40 s total) because warm-up now covers every measured binary,
+# not just the startup baselines.
 #
 # Usage: bash bench_my_fs_warmed.sh [path/to/busybox]
 # Output: Markdown table to stdout.
@@ -120,7 +121,7 @@ warmup_disk() {
     done
 
     # 3. Pre-run every (binary, argv) pair we will measure.
-    for i in $(seq 1 20); do
+    for i in $(seq 1 "$WARMUP_ROUNDS"); do
         $BUSYBOX my_fs          >/dev/null 2>&1
         $BUSYBOX my_fs /        >/dev/null 2>&1
         $BUSYBOX my_fs -h       >/dev/null 2>&1
@@ -143,7 +144,7 @@ warmup_frag() {
     local testfile=$1
     echo "Warming up for fragmentation cases..." >&2
     local i
-    for i in $(seq 1 20); do
+    for i in $(seq 1 "$WARMUP_ROUNDS"); do
         $BUSYBOX my_fs -f "$testfile" >/dev/null 2>&1
         filefrag -v "$testfile"        >/dev/null 2>&1
     done
