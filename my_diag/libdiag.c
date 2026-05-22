@@ -6,30 +6,11 @@
 #include <fcntl.h>
 #include <sys/sysinfo.h>
 
-/* 在緩衝區中找出對應 key 的起始位置，並跳過分隔符號 */
-char *diag_find_key(const char *buf, const char *key)
-{
-	char *ptr = strstr(buf, key);
-	if (ptr) {
-		ptr += strlen(key);
-		while (*ptr == ' ' || *ptr == ':' || *ptr == '\t')
-			ptr++;
-		return ptr;
-	}
-	return NULL;
-}
-
-/* 取得緩衝區中 key 對應的長整型數值 */
-long diag_get_val(const char *buf, const char *key)
-{
-	char *ptr = diag_find_key(buf, key);
-	return ptr ? atol(ptr) : -1;
-}
-
 /* 從 /proc/stat 讀取 CPU 總體時間標記 (CPU ticks) */
 unsigned long long get_cpu_usage_ticks(void)
 {
-	unsigned long long utime, ntime, stime, itime, iowtime, irq, sirq, steal;
+	unsigned long long utime = 0, ntime = 0, stime = 0, itime = 0;
+	unsigned long long iowtime = 0, irq = 0, sirq = 0, steal = 0;
 	char buf[256];
 	FILE *fp = fopen_for_read("/proc/stat");
 	if (!fp)
@@ -109,7 +90,7 @@ const char *diag_get_tcp_state(int state)
 									   "LAST_ACK",
 									   "LISTEN",
 									   "CLOSING"};
-	if (state < 1 || state > 11)
+	if (state < 1 || state > DIAG_TCP_STATES_MAX)
 		return tcp_states[0];
 	return tcp_states[state];
 }
@@ -239,6 +220,7 @@ void diag_free_frag(diag_frag_t *f)
 /* 獲取當前系統資源快照，包含記憶體、負載與 CPU 標記 */
 void diag_get_sys_snap(diag_sys_snap_t *snap)
 {
+	memset(snap, 0, sizeof(*snap));
 	struct sysinfo si;
 	if (sysinfo(&si) == 0) {
 		snap->total_mem_kb =
@@ -272,13 +254,51 @@ void diag_ui_mode_normal(struct termios *old_t)
 	fflush(stdout);
 }
 
+static struct termios g_tui_saved_termios;
+static volatile sig_atomic_t g_tui_active = 0;
+
+void diag_tui_restore(void)
+{
+	static const char show_cursor[] = DIAG_SHOW;
+	if (!g_tui_active)
+		return;
+	g_tui_active = 0;
+	tcsetattr(STDIN_FILENO, TCSANOW, &g_tui_saved_termios);
+	write(STDOUT_FILENO, show_cursor, sizeof(show_cursor) - 1);
+}
+
+static void diag_tui_atexit(void) { diag_tui_restore(); }
+
+static void diag_tui_sig_handler(int sig)
+{
+	diag_tui_restore();
+	signal(sig, SIG_DFL);
+	raise(sig);
+}
+
+void diag_tui_init(void)
+{
+	static int registered = 0;
+	if (g_tui_active)
+		return;
+	set_termios_to_raw(STDIN_FILENO, &g_tui_saved_termios, 0);
+	printf(DIAG_HIDE DIAG_CLR_SCR);
+	fflush(stdout);
+	g_tui_active = 1;
+	if (!registered) {
+		atexit(diag_tui_atexit);
+		bb_signals(BB_FATAL_SIGS, diag_tui_sig_handler);
+		registered = 1;
+	}
+}
+
 /* 在 UI 執行期間提示使用者輸入整數 (會暫時恢復正常終端模式) */
-int diag_ui_ask_int(const char *prompt, struct termios *old_t)
+int diag_ui_ask_int(const char *prompt)
 {
 
 	char buf[32];
 	int res = 0;
-	diag_ui_mode_normal(old_t);
+	diag_tui_restore();
 	printf("\n%s", prompt);
 	fflush(stdout);
 
@@ -286,13 +306,33 @@ int diag_ui_ask_int(const char *prompt, struct termios *old_t)
 		res = atoi(buf);
 	}
 
-	diag_ui_mode_raw(old_t);
+	diag_tui_init();
 	return res;
 }
 
+int diag_ui_read_key(char *out_key)
+{
+	struct pollfd pfd = {STDIN_FILENO, POLLIN, 0};
+	char c;
+
+	if (safe_poll(&pfd, 1, 0) <= 0)
+		return 0;
+
+	if (safe_read(STDIN_FILENO, &c, 1) <= 0)
+		return -1;
+
+	if (c == 27) {
+		while (safe_poll(&pfd, 1, 0) > 0 && safe_read(STDIN_FILENO, &c, 1) > 0)
+			continue;
+		return 0;
+	}
+
+	*out_key = (char) toupper((unsigned char)c);
+	return 1;
+}
+
 /* 二元搜尋輔助函式：根據 ID 搜尋節點 */
-static diag_node_base_t *
-find_base_node(diag_node_base_t **arr, int size, int id)
+diag_node_base_t *diag_find_node(diag_node_base_t **arr, int size, int id)
 {
 	int low = 0, high = size - 1;
 	while (low <= high) {
@@ -308,9 +348,11 @@ find_base_node(diag_node_base_t **arr, int size, int id)
 }
 
 /* 排序比較函式：根據 ID 升序排序 */
-static int diag_node_cmp(const void *a, const void *b)
+int diag_node_cmp(const void *a, const void *b)
 {
-	return (*(diag_node_base_t **) a)->id - (*(diag_node_base_t **) b)->id;
+	int id_a = (*(diag_node_base_t **) a)->id;
+	int id_b = (*(diag_node_base_t **) b)->id;
+	return DIAG_CMP(id_a, id_b);
 }
 
 /* 將鏈結串列轉換為指標陣列以便於排序與隨機存取 */
@@ -352,7 +394,7 @@ diag_node_base_t *diag_link_tree(diag_node_base_t **nodes, int count)
 		diag_node_base_t *curr = nodes[i];
 		diag_node_base_t *parent =
 			(curr->parent_id > 0)
-				? find_base_node(nodes, count, curr->parent_id)
+				? diag_find_node(nodes, count, curr->parent_id)
 				: NULL;
 
 		if (parent && parent != curr) {
@@ -366,4 +408,24 @@ diag_node_base_t *diag_link_tree(diag_node_base_t **nodes, int count)
 		}
 	}
 	return root_list;
+}
+
+void diag_free_node_list(diag_node_base_t *head)
+{
+	while (head) {
+		diag_node_base_t *tmp = head;
+		head = head->next;
+		free(tmp);
+	}
+}
+
+void diag_delay(int ms, int batch_mode)
+{
+	if (batch_mode) {
+		/* Batch 模式不依賴互動，純休眠以免讀到 EOF 引發 100% CPU 空轉 */
+		usleep((useconds_t)ms * 1000);
+	} else {
+		struct pollfd pfd = {STDIN_FILENO, POLLIN, 0};
+		safe_poll(&pfd, 1, ms);
+	}
 }

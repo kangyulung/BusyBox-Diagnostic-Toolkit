@@ -7,6 +7,9 @@
 /* ANSI 控制序列：用於 UI 渲染 */
 #define DIAG_CLR_EOL "\033[K" /* 清除至行尾 */
 #define DIAG_CLR_SCR "\033[H" /* 游標移至左上角 */
+#define DIAG_CLEAR "\033[H\033[J" /* 游標移至左上角並清除整個螢幕 */
+#define DIAG_CLR_DOWN "\033[J" /* 清除游標位置到螢幕底部的內容 */
+#define DIAG_INVERT "\e[7m"    /* 反白顯示 */
 #define DIAG_RESET "\e[0m"	  /* 重置顏色與格式 */
 #define DIAG_RED "\e[1;31m"
 #define DIAG_GREEN "\e[1;32m"
@@ -14,6 +17,15 @@
 #define DIAG_CYAN "\e[1;36m"
 #define DIAG_HIDE "\033[?25l" /* 隱藏游標 */
 #define DIAG_SHOW "\033[?25h" /* 顯示游標 */
+
+/* 批次模式安全格式化 (Batch 模式輸出空字串，否則輸出 ANSI 控制碼) */
+#define DIAG_ANSI(batch, ansi) ((batch) ? "" : (ansi))
+
+/* 安全比較巨集，回傳 -1, 0, 1 (避免相減溢位並簡化 qsort 比較) */
+#define DIAG_CMP(a, b) (((a) > (b)) - ((a) < (b)))
+
+/* TCP 狀態數量上限 */
+#define DIAG_TCP_STATES_MAX 11
 
 /* 樹狀結構基礎節點：用於建立行程間的父子關係 */
 typedef struct diag_node_base {
@@ -32,13 +44,6 @@ typedef struct {
 	uint64_t free_bytes;	  /* 非 root 用戶可用空間 */
 	uint64_t free_bytes_priv; /* 含 root 保留區的剩餘空間 */
 } diag_fs_t;
-
-/* 網路連線狀態 (解析自 /proc/net/tcp) */
-typedef struct {
-	char local_addr[48];  /* 本地端位址與埠號 */
-	char remote_addr[48]; /* 遠端位址與埠號 */
-	int state;			  /* TCP 狀態碼 */
-} diag_net_t;
 
 /* 單檔碎片分析結果 */
 typedef struct {
@@ -60,8 +65,6 @@ typedef struct {
 } diag_sys_snap_t;
 
 /* 通用解析與格式化工具 */
-char *diag_find_key(const char *buf, const char *key);
-long diag_get_val(const char *buf, const char *key);
 unsigned long long get_cpu_usage_ticks(void);
 char *
 diag_format_time(char *buf, unsigned long long utime, unsigned long long stime);
@@ -74,12 +77,17 @@ void diag_get_sys_snap(diag_sys_snap_t *snap);
 /* 終端 UI 模式控制 */
 void diag_ui_mode_raw(struct termios *old); /* 開啟 Raw mode 以處理單鍵輸入 */
 void diag_ui_mode_normal(struct termios *old); /* 恢復標準終端模式 */
-int diag_ui_ask_int(const char *prompt,
-					struct termios *old); /* 彈出式詢問數值 */
+void diag_tui_init(void);                /* 開啟 TUI (Raw mode、隱藏游標、註冊 cleanup) */
+void diag_tui_restore(void);             /* 關閉 TUI (恢復游標與終端模式) */
+int diag_ui_ask_int(const char *prompt); /* 彈出式詢問數值 (會自動暫停與恢復 TUI) */
+int diag_ui_read_key(char *out_key);     /* 讀取單一按鍵（自動過濾 ESC 序列） */
 
 /* 樹狀結構建構工具 */
 diag_node_base_t **diag_nodes_to_array(diag_node_base_t *list, int *out_cnt);
 diag_node_base_t *diag_link_tree(diag_node_base_t **nodes, int count);
+diag_node_base_t *diag_find_node(diag_node_base_t **arr, int size, int id);
+int diag_node_cmp(const void *a, const void *b);
+void diag_free_node_list(diag_node_base_t *head);
 
 /*
  * 對單一正規檔案執行 FIEMAP ioctl，填入 f->file_size 與 f->extent_count。
@@ -91,5 +99,8 @@ int diag_read_fragmentation(const char *path,
 							diag_frag_t *f,
 							int collect_extents);
 void diag_free_frag(diag_frag_t *f);
+
+/* 統一的等待與輪詢函式 (Batch 模式純休眠，TUI 模式則 polling stdin) */
+void diag_delay(int ms, int batch_mode);
 
 #endif

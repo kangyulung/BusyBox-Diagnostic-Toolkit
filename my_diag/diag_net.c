@@ -28,14 +28,9 @@
 //usage:     "\n	-p		Show PID/program (requires root for all processes)"
 // clang-format on
 
-#include "libbb.h"
 #include "libdiag.h"
-#include <termios.h>
-#include <signal.h>
-#include <ctype.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <dirent.h>
 
 /* ═══════════════════════════════════════════════════════════════
  * 資料結構
@@ -62,6 +57,20 @@ typedef struct net_entry {
 	pid_t pid;
 	char comm[16];         /* 縮減至 16 bytes，對齊 Linux 核心 comm 長度 */
 } net_entry_t;
+
+typedef struct {
+	bool show_tcp;
+	bool show_udp;
+	bool listen_only;
+	bool filter_state;
+	int target_state;
+	bool show_pid;
+	bool numeric;
+	bool batch_mode;
+	int interval;
+} net_ctx_t;
+
+static net_ctx_t G;
 
 /* ── 動態陣列：消除硬限制並提供快取友好佈局 ── */
 static net_entry_t *g_entries = NULL;
@@ -92,9 +101,8 @@ static void fast_format_ipv4(char *p, uint32_t addr, uint16_t port)
 }
 
 /* 統計用 */
-#define N_TCP_STATES 11
 typedef struct {
-	int counts[N_TCP_STATES + 1]; /* index = state code (1~11) */
+	int counts[DIAG_TCP_STATES_MAX + 1]; /* index = state code (1~11) */
 	int tcp_total;
 	int udp_total;
 } net_stats_t;
@@ -210,11 +218,7 @@ static int cmp_by_inode(const void *a, const void *b)
 {
 	const net_entry_t *ea = *(const net_entry_t **) a;
 	const net_entry_t *eb = *(const net_entry_t **) b;
-	if (ea->inode < eb->inode)
-		return -1;
-	if (ea->inode > eb->inode)
-		return 1;
-	return 0;
+	return DIAG_CMP(ea->inode, eb->inode);
 }
 
 static void resolve_pids(void)
@@ -232,7 +236,7 @@ static void resolve_pids(void)
 	procps_status_t *proc = NULL;
 	struct dirent *entry;
 	DIR *d_fd;
-	char name[sizeof("/proc/%u/fd/0123456789") + sizeof(int) * 3];
+	char name[64];
 	unsigned baseofs;
 	int unmapped = g_entries_cnt;
 
@@ -294,12 +298,7 @@ static void resolve_pids(void)
  * 解析 /proc/net/{tcp,tcp6,udp,udp6}
  * ═══════════════════════════════════════════════════════════════ */
 
-static void parse_net_file(const char *path,
-								   int is_udp,
-								   int is_ipv6,
-								   int listen_only,
-								   int filter_state,
-								   int target_state)
+static void parse_net_file(const char *path, int is_udp, int is_ipv6)
 {
 	FILE *fp = fopen_for_read(path);
 	if (!fp)
@@ -325,7 +324,7 @@ static void parse_net_file(const char *path,
 		if (!parse_proc_line_raw(line, e))
 			continue;
 
-		if (listen_only) {
+		if (G.listen_only) {
 			if (is_udp) {
 				int remote_is_zero = (e->rport == 0) && 
 					(is_ipv6 ? (e->raddr6[0] == 0 && e->raddr6[1] == 0 && e->raddr6[2] == 0 && e->raddr6[3] == 0) : (e->raddr4 == 0));
@@ -335,7 +334,7 @@ static void parse_net_file(const char *path,
 				continue;
 			}
 		}
-		if (filter_state && e->state != target_state)
+		if (G.filter_state && e->state != G.target_state)
 			continue;
 
 		e->pid = 0;
@@ -359,7 +358,7 @@ static void count_states(net_stats_t *st)
 			st->udp_total++;
 		} else {
 			st->tcp_total++;
-			if (e->state >= 1 && e->state <= N_TCP_STATES)
+			if (e->state >= 1 && e->state <= DIAG_TCP_STATES_MAX)
 				st->counts[e->state]++;
 		}
 	}
@@ -369,11 +368,11 @@ static void count_states(net_stats_t *st)
  * 格式化輸出
  * ═══════════════════════════════════════════════════════════════ */
 
-static void print_header(int show_pid, int batch)
+static void print_header(void)
 {
-	const char *eol = batch ? "" : DIAG_CLR_EOL;
+	const char *eol = DIAG_ANSI(G.batch_mode, DIAG_CLR_EOL);
 
-	if (show_pid) {
+	if (G.show_pid) {
 		printf("%-6s %-14s %-42s %-42s %-16s %s%s\n",
 			   "Proto",
 			   "State",
@@ -391,7 +390,7 @@ static void print_header(int show_pid, int batch)
 			   "User",
 			   eol);
 	}
-	if (!batch)
+	if (!G.batch_mode)
 		printf("%.128s%s\n",
 			   "----------------------------------------------"
 			   "----------------------------------------------"
@@ -409,10 +408,10 @@ format_ipv6(const uint32_t addr6[4], uint16_t port, char *out, size_t outlen)
 	snprintf(out, outlen, "[%s]:%u", ip, (unsigned) port);
 }
 
-static void print_entry(const net_entry_t *e, int show_pid, int numeric, int batch)
+static void print_entry(const net_entry_t *e)
 {
 	char local[64], remote[64];
-	const char *eol = batch ? "" : DIAG_CLR_EOL;
+	const char *eol = DIAG_ANSI(G.batch_mode, DIAG_CLR_EOL);
 
 	if (e->is_ipv6) {
 		format_ipv6(e->laddr6, e->lport, local, sizeof(local));
@@ -430,14 +429,14 @@ static void print_entry(const net_entry_t *e, int show_pid, int numeric, int bat
 	const char *user;
 	char uid_buf[16];
 
-	if (numeric) {
+	if (G.numeric) {
 		snprintf(uid_buf, sizeof(uid_buf), "%u", e->uid);
 		user = uid_buf;
 	} else {
 		user = get_cached_username(e->uid);
 	}
 
-	if (show_pid) {
+	if (G.show_pid) {
 		char pid_comm[32];
 		if (e->pid > 0) {
 			snprintf(pid_comm,
@@ -457,17 +456,16 @@ static void print_entry(const net_entry_t *e, int show_pid, int numeric, int bat
 }
 
 /* TCP 狀態分布摘要 + 異常警告 */
-static void print_summary(const net_stats_t *st, int batch)
+static void print_summary(const net_stats_t *st)
 {
-	const char *eol = batch ? "" : DIAG_CLR_EOL;
+	const char *eol = DIAG_ANSI(G.batch_mode, DIAG_CLR_EOL);
 
-	printf("\n%sTCP state summary%s (total=%d)%s%s\n",
-		   batch ? "" : DIAG_CYAN,
-		   batch ? "" : DIAG_RESET,
+	printf("\n%sTCP state summary%s (total=%d)%s\n",
+		   DIAG_ANSI(G.batch_mode, DIAG_CYAN),
+		   DIAG_ANSI(G.batch_mode, DIAG_RESET),
 		   st->tcp_total,
-		   eol,
-		   batch ? "" : DIAG_CLR_EOL);
-	for (int i = 1; i <= 11; i++) {
+		   eol);
+	for (int i = 1; i <= DIAG_TCP_STATES_MAX; i++) {
 		if (st->counts[i] > 0)
 			printf("  %-15s %d%s\n", diag_get_tcp_state(i), st->counts[i], eol);
 	}
@@ -481,15 +479,15 @@ static void print_summary(const net_stats_t *st, int batch)
 
 	if (anomalies > 0) {
 		printf("\n%s[ANOMALY DETECTED]%s%s\n",
-			   batch ? "" : DIAG_RED,
-			   batch ? "" : DIAG_RESET,
+			   DIAG_ANSI(G.batch_mode, DIAG_RED),
+			   DIAG_ANSI(G.batch_mode, DIAG_RESET),
 			   eol);
 
 #define PRINT_WARN(fmt, ...) \
 		printf("  %s! " fmt "%s%s\n", \
-			   batch ? "" : DIAG_YELLOW, \
+			   DIAG_ANSI(G.batch_mode, DIAG_YELLOW), \
 			   ##__VA_ARGS__, \
-			   batch ? "" : DIAG_RESET, \
+			   DIAG_ANSI(G.batch_mode, DIAG_RESET), \
 			   eol)
 
 		if (st->counts[6] > 500)
@@ -524,62 +522,40 @@ static const struct {
 	{"/proc/net/udp6", 1, 1},
 };
 
-static void do_scan(int show_tcp,
-					int show_udp,
-					int listen_only,
-					int filter_state,
-					const char *state_str,
-					int show_pid,
-					int numeric,
-					int batch)
+static void do_scan(void)
 {
 	g_entries_cnt = 0;
-	clear_username_cache();
-
-	/* 把 state_str 轉成數字，供 parse_net_file 做早期過濾 */
-	int target_state = -1;
-	if (filter_state && state_str && *state_str) {
-		for (int i = 1; i <= 11; i++) {
-			if (strcasecmp(diag_get_tcp_state(i), state_str) == 0) {
-				target_state = i;
-				break;
-			}
-		}
-	}
 
 	for (size_t i = 0; i < ARRAY_SIZE(g_sources); i++) {
-		if (g_sources[i].is_udp && !show_udp)
+		if (g_sources[i].is_udp && !G.show_udp)
 			continue;
-		if (!g_sources[i].is_udp && !show_tcp)
+		if (!g_sources[i].is_udp && !G.show_tcp)
 			continue;
 
 		parse_net_file(g_sources[i].path,
-										   g_sources[i].is_udp,
-										   g_sources[i].is_ipv6,
-										   listen_only,
-										   filter_state,
-										   target_state);
+					   g_sources[i].is_udp,
+					   g_sources[i].is_ipv6);
 	}
 
-	if (show_pid)
+	if (G.show_pid)
 		resolve_pids();
 
 	net_stats_t st;
 	count_states(&st);
 
-	print_header(show_pid, batch);
+	print_header();
 
 	int printed = 0;
 	for (int i = 0; i < g_entries_cnt; i++) {
-		print_entry(&g_entries[i], show_pid, numeric, batch);
+		print_entry(&g_entries[i]);
 		printed++;
 	}
 
 	if (printed == 0)
-		printf("(no matching connections)%s\n", batch ? "" : DIAG_CLR_EOL);
+		printf("(no matching connections)%s\n", DIAG_ANSI(G.batch_mode, DIAG_CLR_EOL));
 
-	if (show_tcp)
-		print_summary(&st, batch);
+	if (G.show_tcp)
+		print_summary(&st);
 
 	fflush(stdout);
 }
@@ -588,105 +564,52 @@ static void do_scan(int show_tcp,
  * Watch 模式（-w，互動式自動更新）
  * ═══════════════════════════════════════════════════════════════ */
 
-static struct termios g_tui_saved_termios;
-static volatile sig_atomic_t g_tui_active = 0;
-
-static void tui_restore(void)
+static void do_watch(void)
 {
-	static const char show_cursor[] = DIAG_SHOW;
-	if (!g_tui_active)
-		return;
-	g_tui_active = 0;
-	tcsetattr(STDIN_FILENO, TCSANOW, &g_tui_saved_termios);
-	write(STDOUT_FILENO, show_cursor, sizeof(show_cursor) - 1);
-}
-
-static void tui_atexit(void) { tui_restore(); }
-
-static void tui_sig_handler(int sig)
-{
-	tui_restore();
-	signal(sig, SIG_DFL);
-	raise(sig);
-}
-
-static void do_watch(int show_tcp,
-					 int show_udp,
-					 int listen_only,
-					 int filter_state,
-					 const char *state_str,
-					 int show_pid,
-					 int numeric,
-					 int interval_sec,
-					 int batch)
-{
-	struct pollfd pfd = {STDIN_FILENO, POLLIN, 0};
 	char key;
 
-	if (!batch) {
+	if (!G.batch_mode) {
 		if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO))
 			bb_error_msg_and_die("-w requires a terminal; "
 								 "use -b for non-interactive output");
 
-		diag_ui_mode_raw(&g_tui_saved_termios);
-		g_tui_active = 1;
-		atexit(tui_atexit);
-		bb_signals(BB_FATAL_SIGS, tui_sig_handler);
+		diag_tui_init();
 	}
 
 	while (1) {
-		if (!batch) {
-			/* 排空所有輸入，避免方向鍵 (ESC [ A) 造成畫面連閃 */
+		if (!G.batch_mode) {
 			int quit = 0;
-			while (safe_poll(&pfd, 1, 0) > 0) {
-				if (safe_read(STDIN_FILENO, &key, 1) <= 0) {
-					quit = 1; /* 防止 EOF (重新導向或背景執行) 造成 100% CPU 無限空轉 */
-					break;
-				}
-				if (key == 27) {
-					while (safe_poll(&pfd, 1, 0) > 0 && safe_read(STDIN_FILENO, &key, 1) > 0)
-						continue;
-				} else if (toupper((unsigned char) key) == 'Q') {
+			int res;
+			while ((res = diag_ui_read_key(&key)) > 0) {
+				if (key == 'Q')
 					quit = 1;
-				}
 			}
-			if (quit)
+			if (res < 0 || quit)
 				break;
 
 			/* 清屏並印表頭 */
-			printf("\033[H\033[J");
+			printf(DIAG_CLEAR);
 			printf(DIAG_CYAN "[MY_NET]" DIAG_RESET " Refresh: %ds"
 							 "  TCP:%s UDP:%s Listen-only:%s"
 							 "  Press Q to quit" DIAG_CLR_EOL "\n",
-				   interval_sec,
-				   show_tcp ? "on" : "off",
-				   show_udp ? "on" : "off",
-				   listen_only ? "on" : "off");
+				   G.interval,
+				   G.show_tcp ? "on" : "off",
+				   G.show_udp ? "on" : "off",
+				   G.listen_only ? "on" : "off");
 			printf("%.128s" DIAG_CLR_EOL "\n",
 				   "------------------------------------------------------"
 				   "------------------------------------------------------"
 				   "------------------------------------------------------");
 		}
 
-		do_scan(show_tcp,
-				show_udp,
-				listen_only,
-				filter_state,
-				state_str,
-				show_pid,
-				numeric,
-				batch);
+		do_scan();
 
 		fflush(stdout);
-		if (batch)
-			sleep(interval_sec);
-		else
-			safe_poll(&pfd, 1, interval_sec * 1000);
+		diag_delay(G.interval * 1000, G.batch_mode);
 	}
 
-	if (!batch) {
-		g_tui_active = 0;
-		diag_ui_mode_normal(&g_tui_saved_termios);
+	if (!G.batch_mode) {
+		diag_tui_restore();
 		printf("\n");
 		fflush(stdout);
 	}
@@ -696,61 +619,51 @@ static void do_watch(int show_tcp,
  * main
  * ═══════════════════════════════════════════════════════════════ */
 
+enum {
+	OPT_t = (1 << 0),
+	OPT_u = (1 << 1),
+	OPT_a = (1 << 2),
+	OPT_l = (1 << 3),
+	OPT_n = (1 << 4),
+	OPT_p = (1 << 5),
+	OPT_b = (1 << 6),
+	OPT_s = (1 << 7),
+	OPT_w = (1 << 8),
+};
+
 int my_net_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
 int my_net_main(int argc, char **argv)
 {
 	setvbuf(stdout, NULL, _IOFBF, 65536);
 	char *opt_s = NULL;
-	unsigned opts;
-	int opt_t, opt_u, show_all;
-	int show_tcp, show_udp;
-	int listen_only, filter_state, has_watch, batch, show_pid, numeric;
-	int interval = 2, is_batch;
+	int interval = 2;
 
-	/*
-     * getopt32 選項字串：t u a l n p b s: w:+
-     * bit 0=t  1=u  2=a  3=l  4=n  5=p  6=b  7=s  8=w
-     */
-	opts = getopt32(argv, "tualnpbs:w:+", &opt_s, &interval);
+	unsigned opts = getopt32(argv, "tualnpbs:w:+", &opt_s, &interval);
 
-	opt_t = (opts & (1 << 0));
-	opt_u = (opts & (1 << 1));
-	show_all = (opts & (1 << 2));
-	listen_only = (opts & (1 << 3));
-	numeric = (opts & (1 << 4));      /* -n */
-	show_pid = (opts & (1 << 5));	  /* -p */
-	batch = (opts & (1 << 6));		  /* -b */
-	filter_state = (opts & (1 << 7)); /* -s */
-	has_watch = (opts & (1 << 8));	  /* -w */
+	G.show_tcp = (opts & OPT_t) || (opts & OPT_a) || (!(opts & OPT_t) && !(opts & OPT_u));
+	G.show_udp = (opts & OPT_u) || (opts & OPT_a);
+	G.listen_only = (opts & OPT_l);
+	G.numeric = (opts & OPT_n);
+	G.show_pid = (opts & OPT_p);
+	G.batch_mode = (opts & OPT_b) || !isatty(STDOUT_FILENO);
+	G.filter_state = (opts & OPT_s);
+	G.interval = (interval < 1) ? 1 : interval;
 
-	show_tcp = opt_t || show_all || (!opt_t && !opt_u);
-	show_udp = opt_u || show_all;
-
-	if (has_watch && interval < 1)
-		interval = 1;
-
-	is_batch = batch || !isatty(STDOUT_FILENO);
-
-	if (has_watch) {
-		do_watch(show_tcp,
-				 show_udp,
-				 listen_only,
-				 filter_state,
-				 opt_s ? opt_s : "",
-				 show_pid,
-				 numeric,
-				 interval,
-				 is_batch);
-	} else {
-		do_scan(show_tcp,
-				show_udp,
-				listen_only,
-				filter_state,
-				opt_s ? opt_s : "",
-				show_pid,
-				numeric,
-				is_batch);
+	/* 提早解析狀態字串，避免 Watch 模式下每秒重複解析 */
+	if (G.filter_state && opt_s && *opt_s) {
+		G.target_state = -1;
+		for (int i = 1; i <= DIAG_TCP_STATES_MAX; i++) {
+			if (strcasecmp(diag_get_tcp_state(i), opt_s) == 0) {
+				G.target_state = i;
+				break;
+			}
+		}
 	}
+
+	if (opts & OPT_w)
+		do_watch();
+	else
+		do_scan();
 
 	return EXIT_SUCCESS;
 }
