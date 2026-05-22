@@ -29,6 +29,7 @@
 #include <sys/sysinfo.h>
 #include <termios.h>
 #include <ctype.h>
+#include <signal.h>
 #define SAFE_COMPARE(a, b) (((a) > (b)) - ((a) < (b)))
 
 typedef struct proc_node {
@@ -61,6 +62,28 @@ static proc_ctx_t G = {VIEW_TOP, 'P', -1, 1.0, -1, false, 80, 24};
 #define CLR_EOL (G.batch_mode ? "" : DIAG_CLR_EOL)
 #define CLR_SCR (G.batch_mode ? "" : DIAG_CLR_SCR)
 
+static struct termios g_saved_termios;
+static volatile sig_atomic_t g_tui_active = 0;
+
+static void tui_restore(void)
+{
+	static const char show_cursor[] = DIAG_SHOW;
+	if (!g_tui_active)
+		return;
+	g_tui_active = 0;
+	tcsetattr(STDIN_FILENO, TCSANOW, &g_saved_termios);
+	write(STDOUT_FILENO, show_cursor, sizeof(show_cursor) - 1);
+}
+
+static void tui_atexit(void) { tui_restore(); }
+
+static void tui_sig_handler(int sig)
+{
+	tui_restore();
+	signal(sig, SIG_DFL);
+	raise(sig);
+}
+
 static void update_term_size(void)
 {
 	if (G.batch_mode) {
@@ -87,7 +110,7 @@ static const char *get_sort_label(void)
 	case 'U':
 		return "USER";
 	case 'S':
-		return "STAT";
+		return "SID";
 	case 'C':
 		return "COMMAND";
 	default:
@@ -122,7 +145,7 @@ static int sort_func(const void *a, const void *b)
 		res = SAFE_COMPARE(pa->uid, pb->uid);
 		break;
 	case 'S':
-		res = SAFE_COMPARE(pa->state[0], pb->state[0]);
+		res = SAFE_COMPARE(pa->sid, pb->sid);
 		break;
 	case 'C':
 		res = strcmp(pa->comm, pb->comm);
@@ -244,31 +267,40 @@ static void print_header(diag_sys_snap_t *snap)
 		   CLR_EOL);
 }
 
-static bool handle_input(struct termios *old_t)
+//static bool handle_input(struct termios *old_t)
+static bool handle_input(void)
 {
 	struct pollfd pfd = {STDIN_FILENO, POLLIN, 0};
 	char c;
 
-	if (G.batch_mode || safe_poll(&pfd, 1, 0) <= 0)
+	if (G.batch_mode)
 		return true;
-	if (safe_read(STDIN_FILENO, &c, 1) <= 0)
-		return true;
-	c = toupper(c);
-	if (c == 'Q')
-		return false;
-	if (c == 'T') {
-		G.view_mode = (G.view_mode == VIEW_TREE) ? VIEW_TOP : VIEW_TREE;
-		printf("\033[H\033[J");
-	} else if (strchr("PMIVOUSC", c)) {
-		G.sort_mode = c;
-	} else if (c == 'K') {
-		int pid_to_kill =
-			diag_ui_ask_int("Enter PID to kill (0 to cancel): ", old_t);
-		if (pid_to_kill > 0) {
-			if (kill(pid_to_kill, SIGTERM) == 0)
-				sleep1();
-			else
-				bb_perror_msg("kill failed");
+	while (safe_poll(&pfd, 1, 0) > 0) {
+		if (safe_read(STDIN_FILENO, &c, 1) <= 0)
+			return false; /* 發生 EOF，直接離開程式避免無限空轉 */
+		if (c == 27) {
+			/* 吞掉後續的 Escape Sequence (例如方向鍵) 避免畫面連閃 */
+			while (safe_poll(&pfd, 1, 0) > 0 && safe_read(STDIN_FILENO, &c, 1) > 0)
+				continue;
+			continue;
+		}
+		c = toupper((unsigned char)c);
+		if (c == 'Q')
+			return false;
+		if (c == 'T') {
+			G.view_mode = (G.view_mode == VIEW_TREE) ? VIEW_TOP : VIEW_TREE;
+			printf("\033[H\033[J");
+		} else if (c && strchr("PMIVOUSC", c)) {
+			G.sort_mode = c;
+		} else if (c == 'K') {
+			int pid_to_kill =
+				diag_ui_ask_int("Enter PID to kill (0 to cancel): ", &g_saved_termios);
+			if (pid_to_kill > 0) {
+				if (kill(pid_to_kill, SIGTERM) == 0)
+					sleep1();
+				else
+					bb_perror_msg("kill failed");
+			}
 		}
 	}
 	return true;
@@ -331,20 +363,21 @@ static void display_list(proc_node_t *list, proc_node_t **sorted_arr, int cnt)
 {
 
 	qsort(sorted_arr, cnt, sizeof(proc_node_t *), sort_func);
-	int fixed_width = 6 + 1 + 6 + 1 + 4 + 1 + 10 + 1 + 4 + 1 + 4 + 1 + 10 + 1 +
-					  10 + 1 + 6 + 1 + 6 + 1 + 8 + 1;
-	int comm_width = G.width - fixed_width;
+	int fixed_width = 6 + 1 + 6 + 1 + 6 + 1 + 10 + 1 + 4 + 1 + 4 + 1 + 8 + 1 +
+					  8 + 1 + 6 + 1 + 6 + 1 + 8 + 1;
+	int comm_width = G.width - fixed_width - 1;
 	if (comm_width < 10)
 		comm_width = 10;
 	if (G.batch_mode) {
-		printf("PID    PPID   THR  USER       STAT NI   VSZ        RSS        "
-			   "%%CPU   %%MEM   TIME     COMMAND\n");
+		printf("%-6s %-6s %-6s %-10s %-4s %-4s %8s %8s %6s %6s %8s COMMAND\n",
+			   "PID", "PPID", "SID", "USER", "STAT", "NI", "VSZ", "RSS",
+			   "%CPU", "%MEM", "TIME");
 	} else {
-			printf("%-6s %-6s %-4s %-10s %-4s %-4s %-10s %-10s %-6s %-6s %-8s "
-			   "%-*.*s%s\n",
+		printf("%-6s %-6s %-6s %-10s %-4s %-4s %8s %8s %6s %6s %8s "
+			   "%.*s%s\n",
 			   "PID",
 			   "PPID",
-			   "THR",
+			   "SID",
 			   "USER",
 			   "STAT",
 			   "NI",
@@ -353,7 +386,6 @@ static void display_list(proc_node_t *list, proc_node_t **sorted_arr, int cnt)
 			   "%CPU",
 			   "%MEM",
 			   "TIME",
-			   comm_width,
 			   comm_width,
 			   "COMMAND",
 			   CLR_EOL);
@@ -365,8 +397,8 @@ static void display_list(proc_node_t *list, proc_node_t **sorted_arr, int cnt)
 			break;
 		proc_node_t *cn = sorted_arr[i];
 		const char *user = get_cached_username(cn->pinfo->uid);
-		printf("%-6d %-6d %-4d %-10.10s %-4c %-4d %-10s %-10s %4u.%1u %4u.%1u "
-			   "%-8s %-*.*s%s\n",
+		printf("%-6d %-6d %-6d %-10.10s %-4c %-4d %8s %8s %4u.%1u %4u.%1u "
+			   "%8s %.*s%s\n",
 			   cn->pinfo->pid,
 			   cn->pinfo->ppid,
 			   cn->pinfo->sid,
@@ -378,7 +410,6 @@ static void display_list(proc_node_t *list, proc_node_t **sorted_arr, int cnt)
 			   cn->cpu_pcnt_10 / 10, cn->cpu_pcnt_10 % 10,
 			   cn->mem_pcnt_10 / 10, cn->mem_pcnt_10 % 10,
 			   cn->time_str,
-			   G.batch_mode ? 0 : comm_width,
 			   G.batch_mode ? 256 : comm_width,
 			   cn->pinfo->comm,
 			   CLR_EOL);
@@ -393,12 +424,14 @@ static void show_top_with_cpu(void)
 	proc_node_t **prev_sort_arr = NULL;
 	int prev_cnt = 0;
 	unsigned long long prev_ticks = 0;
-	struct termios old_t;
 
 	if (!isatty(STDOUT_FILENO))
 		G.batch_mode = true;
 	if (!G.batch_mode) {
-		diag_ui_mode_raw(&old_t);
+		diag_ui_mode_raw(&g_saved_termios);
+		g_tui_active = 1;
+		atexit(tui_atexit);
+		bb_signals(BB_FATAL_SIGS, tui_sig_handler);
 	}
 
 	while (G.iterations != 0) {
@@ -417,7 +450,7 @@ static void show_top_with_cpu(void)
 			qsort(prev_sort_arr, prev_cnt, sizeof(proc_node_t *), sort_by_pid);
 		}
 
-		if (!handle_input(&old_t)) {
+		if (!handle_input()) {
 			if (curr_list)
 				free_proc_list(curr_list);
 			free(curr_sort_arr);
@@ -435,7 +468,7 @@ static void show_top_with_cpu(void)
 
 		if (!G.batch_mode) {
 			printf("\033[J\n\e[7m SORT: (P)CPU (M)RSS (V)VSZ (I)PID (O)PPID "
-				   "(U)USER (S)STAT (C)CMD | (T)TREE (K)KILL (Q)QUIT \e[0m%s",
+				   "(U)USER (S)SID (C)CMD | (T)TREE (K)KILL (Q)QUIT \e[0m%s",
 				   CLR_EOL);
 			fflush(stdout);
 		}
@@ -455,12 +488,22 @@ static void show_top_with_cpu(void)
 		if (G.iterations == 0)
 			break;
 
-		struct pollfd pfd = {STDIN_FILENO, POLLIN, 0};
-		safe_poll(&pfd, 1, (int) (G.delay * 1000));
+		if (G.batch_mode) {
+			/* Batch mode 不依賴輸入，純粹休眠以免讀到 EOF 引發 CPU Spinning */
+			usleep((useconds_t)(G.delay * 1000000));
+		} else {
+			struct pollfd pfd = {STDIN_FILENO, POLLIN, 0};
+			safe_poll(&pfd, 1, (int) (G.delay * 1000));
+		}
 	}
 
+	if (prev_list)
+		free_proc_list(prev_list);
+	if (prev_sort_arr)
+		free(prev_sort_arr);
+
 	if (!G.batch_mode) {
-		diag_ui_mode_normal(&old_t);
+		tui_restore();
 		printf("\n");
 		fflush(stdout);
 	}
