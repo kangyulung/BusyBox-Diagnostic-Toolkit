@@ -28,14 +28,9 @@
 //usage:     "\n	-p		Show PID/program (requires root for all processes)"
 // clang-format on
 
-#include "libbb.h"
 #include "libdiag.h"
-#include <termios.h>
-#include <ctype.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <dirent.h>
-#include <sys/syscall.h>
 
 /* ═══════════════════════════════════════════════════════════════
  * 資料結構
@@ -43,243 +38,78 @@
 
 /* 解析後的單一 socket 記錄 */
 typedef struct net_entry {
-	char proto[8];
 	/* --- 改存 raw binary，延遲格式化 --- */
-	uint32_t laddr4, raddr4;	   /* IPv4 (host byte order) */
-	uint32_t laddr6[4], raddr6[4]; /* IPv6 (已 htonl) */
+	union {
+		uint32_t laddr4;       /* IPv4 (host byte order) */
+		uint32_t laddr6[4];    /* IPv6 (已 htonl) */
+	};
+	union {
+		uint32_t raddr4;
+		uint32_t raddr6[4];
+	};
 	uint16_t lport, rport;
 	uint8_t is_ipv6;
+	uint8_t is_udp;        /* 替代原有的 char proto[8] */
 	/* ---------------------------------- */
 	int state;
 	unsigned uid;
 	unsigned long inode;
 	pid_t pid;
-	char comm[32];
-	struct net_entry *next;
+	char comm[16];         /* 縮減至 16 bytes，對齊 Linux 核心 comm 長度 */
 } net_entry_t;
 
-/* inode -> PID 對照表（掃描 /proc/PID/fd/ 建立） */
-#define INODE_MAP_MAX 4096
 typedef struct {
-	unsigned long inode;
-	pid_t pid;
-	char comm[32];
-} inode_map_t;
+	bool show_tcp;
+	bool show_udp;
+	bool listen_only;
+	bool filter_state;
+	int target_state;
+	bool show_pid;
+	bool numeric;
+	bool batch_mode;
+	int interval;
+} net_ctx_t;
 
-static inode_map_t g_imap[INODE_MAP_MAX];
-static int g_imap_cnt = 0;
+static net_ctx_t G;
 
-/* ── 靜態記憶體池：消除 per-entry xzalloc ── */
-#define ENTRY_POOL_MAX 1024
-static net_entry_t *g_entry_pool = NULL;
-static int g_pool_idx = 0;
+/* ── 動態陣列：消除硬限制並提供快取友好佈局 ── */
+static net_entry_t *g_entries = NULL;
+static int g_entries_cnt = 0;
+static int g_entries_cap = 0;
 
-static void ensure_pool(void)
+static net_entry_t *get_next_entry(void)
 {
-	if (!g_entry_pool)
-		g_entry_pool = xmalloc(sizeof(net_entry_t) * ENTRY_POOL_MAX);
-}
-
-static net_entry_t *pool_alloc(void)
-{
-	if (g_pool_idx >= ENTRY_POOL_MAX)
-		return NULL;
-	net_entry_t *e = &g_entry_pool[g_pool_idx++];
+	if (g_entries_cnt >= g_entries_cap) {
+		g_entries_cap = g_entries_cap ? g_entries_cap * 2 : 1024;
+		g_entries = xrealloc(g_entries, g_entries_cap * sizeof(*g_entries));
+	}
+	net_entry_t *e = &g_entries[g_entries_cnt];
 	memset(e, 0, sizeof(*e));
 	return e;
 }
 
-/* ── UID → 使用者名稱快取（避免重複 getpwuid 呼叫） ── */
-#define UID_CACHE_MAX 32
-static struct {
-	unsigned uid;
-	char name[32]; /* 直接內嵌，避免二次 heap 分配 */
-	int valid;
-} g_uid_cache[UID_CACHE_MAX];
-static int g_uid_cache_cnt = 0;
-
-static const char *diag_uid2uname(unsigned uid)
+static void commit_entry(void)
 {
-	int i;
-	/* 線性搜尋：uid 種類通常 < 10，不需 hash */
-	for (i = 0; i < g_uid_cache_cnt; i++) {
-		if (g_uid_cache[i].uid == uid)
-			return g_uid_cache[i].name;
-	}
-	/* 快取未命中：查詢並存入 */
-	if (g_uid_cache_cnt < UID_CACHE_MAX) {
-		const char *n = uid2uname(uid); /* libbb 原始查詢 */
-		g_uid_cache[g_uid_cache_cnt].uid = uid;
-		safe_strncpy(
-			g_uid_cache[g_uid_cache_cnt].name, n, sizeof(g_uid_cache[0].name));
-		return g_uid_cache[g_uid_cache_cnt++].name;
-	}
-	return uid2uname(uid); /* 池滿時直接查詢，不快取 */
-}
-
-/* ── 靜態 /proc 讀取緩衝：省去 xmalloc_open_read_close 的 heap 分配 ── */
-#define PROC_NET_BUF (256 * 1024) /* 256 KB 足應對 ~4000 條連線 */
-static char g_proc_buf[PROC_NET_BUF];
-
-/* ── 輸出集中緩衝：減少 write() 次數與 printf 格式化開銷 ── */
-#define OUT_BUF_SIZE (128 * 1024)
-static char g_out_buf[OUT_BUF_SIZE];
-static int g_out_pos = 0;
-
-/* 把緩衝內容一次寫出 */
-static void outbuf_flush(void)
-{
-	if (g_out_pos > 0) {
-		fwrite(g_out_buf, 1, g_out_pos, stdout);
-		g_out_pos = 0;
-	}
-}
-
-/* 把字串 s（長度 len）追加到緩衝，自動觸發 flush */
-static void outbuf_write(const char *s, int len)
-{
-	if (len <= 0)
-		return;
-	if (g_out_pos + len >= OUT_BUF_SIZE)
-		outbuf_flush();
-	memcpy(g_out_buf + g_out_pos, s, len);
-	g_out_pos += len;
-}
-
-/* 快速整數轉十進位字串，回傳寫入長度 */
-static int fast_uint(char *p, unsigned v)
-{
-	char tmp[10];
-	int i = 0, len;
-	if (!v) {
-		*p = '0';
-		return 1;
-	}
-	while (v) {
-		tmp[i++] = (char) ('0' + v % 10);
-		v /= 10;
-	}
-	len = i;
-	while (i--)
-		*p++ = tmp[i];
-	return len;
+	g_entries_cnt++;
 }
 
 /* 快速 IPv4 格式化：寫入 "a.b.c.d:port"，回傳長度 */
-static int fast_format_ipv4(char *p, uint32_t addr, uint16_t port)
+static void fast_format_ipv4(char *p, uint32_t addr, uint16_t port)
 {
 	unsigned char *b = (unsigned char *) &addr;
-	char *s = p;
-	s += fast_uint(s, b[0]);
-	*s++ = '.';
-	s += fast_uint(s, b[1]);
-	*s++ = '.';
-	s += fast_uint(s, b[2]);
-	*s++ = '.';
-	s += fast_uint(s, b[3]);
-	*s++ = ':';
-	s += fast_uint(s, port);
-	*s = '\0';
-	return (int) (s - p);
-}
-/*
- * 讀取 /proc/net/* 至靜態緩衝。
- * 回傳 g_proc_buf 指標（呼叫者不得 free），失敗回傳 NULL。
- * 注意：不支援並發呼叫（parse_net_file 本身是單執行緒）。
- */
-static char *read_proc_net(const char *path)
-{
-	int fd;
-	ssize_t n;
-
-	fd = open(path, O_RDONLY);
-	if (fd < 0)
-		return NULL;
-	n = read(fd, g_proc_buf, PROC_NET_BUF - 1);
-	close(fd);
-	if (n <= 0)
-		return NULL;
-	g_proc_buf[n] = '\0';
-	return g_proc_buf;
+	sprintf(p, "%u.%u.%u.%u:%u", b[0], b[1], b[2], b[3], port);
 }
 
 /* 統計用 */
-#define N_TCP_STATES 12
 typedef struct {
-	int counts[N_TCP_STATES + 1]; /* index = state code (1~11) */
+	int counts[DIAG_TCP_STATES_MAX + 1]; /* index = state code (1~11) */
 	int tcp_total;
 	int udp_total;
 } net_stats_t;
 
-/* 異常警告 */
-#define WARN_MAX 8
-static char g_warn[WARN_MAX][160];
-static int g_warn_cnt;
-
-struct linux_dirent64 {
-	uint64_t d_ino;
-	int64_t d_off;
-	unsigned short d_reclen;
-	unsigned char d_type;
-	char d_name[1]; /* flexible; accessed via pointer cast */
-};
-
-#define DENTS_BUF 4096
-
 /* ═══════════════════════════════════════════════════════════════
  * 位址解析：/proc/net/tcp[6] 的 hex 格式 → 可讀字串
  * ═══════════════════════════════════════════════════════════════ */
-
-/*
- * IPv4：8 hex chars + ':' + 4 hex chars
- * /proc/net/tcp 以 little-endian 32-bit 整數存放（x86 native），
- * 直接 cast 成 in_addr_t 再 inet_ntoa 即得正確點分十進位。
- */
-static void parse_ipv4_addr(const char *hex, char *out, size_t outlen)
-{
-	unsigned long raw_addr;
-	unsigned int port;
-	struct in_addr in;
-
-	if (sscanf(hex, "%lX:%X", &raw_addr, &port) != 2) {
-		snprintf(out, outlen, "?:?");
-		return;
-	}
-	in.s_addr = (in_addr_t) raw_addr;
-	snprintf(out, outlen, "%s:%u", inet_ntoa(in), port);
-}
-
-/*
- * IPv6：32 hex chars + ':' + 4 hex chars
- * /proc/net/tcp6 以 4 個 host-endian uint32 存放，需各別 htonl 後
- * 再組成 in6_addr 才能得到正確的網路位元組序。
- */
-static void parse_ipv6_addr(const char *hex, char *out, size_t outlen)
-{
-	unsigned int port;
-	uint32_t w[4];
-	struct in6_addr in6;
-	char ip_str[INET6_ADDRSTRLEN];
-	const char *colon = strchr(hex, ':');
-
-	if (!colon || (colon - hex) != 32) {
-		snprintf(out, outlen, "?:?");
-		return;
-	}
-	if (sscanf(hex, "%8X%8X%8X%8X:%X", &w[0], &w[1], &w[2], &w[3], &port) !=
-		5) {
-		snprintf(out, outlen, "?:?");
-		return;
-	}
-	/* 每個 32-bit word 在 LE 系統上以 host byte order 存放，需轉回 network order */
-	w[0] = htonl(w[0]);
-	w[1] = htonl(w[1]);
-	w[2] = htonl(w[2]);
-	w[3] = htonl(w[3]);
-	memcpy(&in6, w, sizeof(in6));
-	inet_ntop(AF_INET6, &in6, ip_str, sizeof(ip_str));
-	snprintf(out, outlen, "[%s]:%u", ip_str, port);
-}
 
 static inline char *skip_token(char *p)
 {
@@ -301,17 +131,7 @@ static uint32_t parse_hex8(const char *p)
 	return v;
 }
 
-static int parse_proc_line_raw(const char *line,
-							   int is_ipv6,
-							   uint32_t *laddr4,
-							   uint16_t *lport,
-							   uint32_t *raddr4,
-							   uint16_t *rport,
-							   uint32_t laddr6[4],
-							   uint32_t raddr6[4],
-							   int *state_out,
-							   unsigned *uid_out,
-							   unsigned long *inode_out)
+static int parse_proc_line_raw(const char *line, net_entry_t *e)
 {
 	char *p = (char *) line;
 
@@ -325,57 +145,55 @@ static int parse_proc_line_raw(const char *line,
 	while (*p == ' ')
 		p++;
 
-	if (is_ipv6) {
-		laddr6[0] = htonl(parse_hex8(p));
+	if (e->is_ipv6) {
+		e->laddr6[0] = parse_hex8(p);
 		p += 8;
-		laddr6[1] = htonl(parse_hex8(p));
+		e->laddr6[1] = parse_hex8(p);
 		p += 8;
-		laddr6[2] = htonl(parse_hex8(p));
+		e->laddr6[2] = parse_hex8(p);
 		p += 8;
-		laddr6[3] = htonl(parse_hex8(p));
+		e->laddr6[3] = parse_hex8(p);
 		p += 8;
 		if (*p != ':')
 			return 0;
 		p++;
-		*lport = (uint16_t) strtoul(p, &p, 16);
+		e->lport = (uint16_t) strtoul(p, &p, 16);
 		while (*p == ' ')
 			p++;
 
-		raddr6[0] = htonl(parse_hex8(p));
+		e->raddr6[0] = parse_hex8(p);
 		p += 8;
-		raddr6[1] = htonl(parse_hex8(p));
+		e->raddr6[1] = parse_hex8(p);
 		p += 8;
-		raddr6[2] = htonl(parse_hex8(p));
+		e->raddr6[2] = parse_hex8(p);
 		p += 8;
-		raddr6[3] = htonl(parse_hex8(p));
+		e->raddr6[3] = parse_hex8(p);
 		p += 8;
 		if (*p != ':')
 			return 0;
 		p++;
-		*rport = (uint16_t) strtoul(p, &p, 16);
-		*laddr4 = 0;
-		*raddr4 = 0;
+		e->rport = (uint16_t) strtoul(p, &p, 16);
 	} else {
-		*laddr4 = parse_hex8(p);
+		e->laddr4 = parse_hex8(p);
 		p += 8;
 		if (*p != ':')
 			return 0;
 		p++;
-		*lport = (uint16_t) strtoul(p, &p, 16);
+		e->lport = (uint16_t) strtoul(p, &p, 16);
 		while (*p == ' ')
 			p++;
 
-		*raddr4 = parse_hex8(p);
+		e->raddr4 = parse_hex8(p);
 		p += 8;
 		if (*p != ':')
 			return 0;
 		p++;
-		*rport = (uint16_t) strtoul(p, &p, 16);
+		e->rport = (uint16_t) strtoul(p, &p, 16);
 	}
 	while (*p == ' ')
 		p++;
 
-	*state_out = (int) strtoul(p, &p, 16);
+	e->state = (int) strtoul(p, &p, 16);
 	while (*p == ' ')
 		p++;
 
@@ -383,146 +201,12 @@ static int parse_proc_line_raw(const char *line,
 	p = skip_token(p); /* 跳過 tr:tm_when */
 	p = skip_token(p); /* 跳過 retrnsmt */
 
-	*uid_out = (unsigned) strtoul(p, &p, 10);
+	e->uid = (unsigned) strtoul(p, &p, 10);
 	while (*p == ' ')
 		p++;
 	p = skip_token(p); /* 跳過 timeout */
 
-	*inode_out = strtoul(p, &p, 10);
-	return 1;
-}
-
-static int parse_proc_line(const char *line,
-						   int is_ipv6,
-						   char *local_out,
-						   size_t local_len,
-						   char *remote_out,
-						   size_t remote_len,
-						   int *state_out,
-						   unsigned *uid_out,
-						   unsigned long *inode_out)
-{
-	char *p = (char *) line;
-
-	/* 跳過行首空白與 sl 序號（十進位）及其後的 ':' */
-	while (*p == ' ')
-		p++;
-	while (isdigit((unsigned char) *p))
-		p++;
-	if (*p != ':')
-		return 0;
-	p++;
-	while (*p == ' ')
-		p++;
-
-	if (is_ipv6) {
-		/* local: 4 × 8 hex（無分隔符）→ htonl → in6_addr */
-		uint32_t la[4], ra[4];
-		struct in6_addr in6;
-		char ip[INET6_ADDRSTRLEN];
-		unsigned int lport, rport;
-
-		la[0] = htonl(parse_hex8(p));
-		p += 8;
-		la[1] = htonl(parse_hex8(p));
-		p += 8;
-		la[2] = htonl(parse_hex8(p));
-		p += 8;
-		la[3] = htonl(parse_hex8(p));
-		p += 8;
-		if (*p != ':')
-			return 0;
-		p++;
-		lport = (unsigned int) strtoul(p, &p, 16);
-		while (*p == ' ')
-			p++;
-
-		ra[0] = htonl(parse_hex8(p));
-		p += 8;
-		ra[1] = htonl(parse_hex8(p));
-		p += 8;
-		ra[2] = htonl(parse_hex8(p));
-		p += 8;
-		ra[3] = htonl(parse_hex8(p));
-		p += 8;
-		if (*p != ':')
-			return 0;
-		p++;
-		rport = (unsigned int) strtoul(p, &p, 16);
-
-		memcpy(&in6, la, sizeof(in6));
-		inet_ntop(AF_INET6, &in6, ip, sizeof(ip));
-		snprintf(local_out, local_len, "[%s]:%u", ip, lport);
-		memcpy(&in6, ra, sizeof(in6));
-		inet_ntop(AF_INET6, &in6, ip, sizeof(ip));
-		snprintf(remote_out, remote_len, "[%s]:%u", ip, rport);
-
-	} else {
-		struct in_addr lin, rin;
-		unsigned int lport, rport;
-
-		lin.s_addr = (in_addr_t) parse_hex8(p);
-		p += 8;
-		if (*p != ':')
-			return 0;
-		p++;
-		lport = (unsigned int) strtoul(p, &p, 16);
-		while (*p == ' ')
-			p++;
-
-		rin.s_addr = (in_addr_t) parse_hex8(p);
-		p += 8;
-		if (*p != ':')
-			return 0;
-		p++;
-		rport = (unsigned int) strtoul(p, &p, 16);
-
-		snprintf(local_out, local_len, "%s:%u", inet_ntoa(lin), lport);
-		snprintf(remote_out, remote_len, "%s:%u", inet_ntoa(rin), rport);
-	}
-	while (*p == ' ')
-		p++;
-
-	/* st */
-	*state_out = (int) strtoul(p, &p, 16);
-	while (*p == ' ')
-		p++;
-
-	/* tx:rx（略過）*/
-	strtoul(p, &p, 16);
-	if (*p == ':') {
-		p++;
-		strtoul(p, &p, 16);
-	}
-	while (*p == ' ')
-		p++;
-
-	/* tr:when（略過）*/
-	strtoul(p, &p, 16);
-	if (*p == ':') {
-		p++;
-		strtoul(p, &p, 16);
-	}
-	while (*p == ' ')
-		p++;
-
-	/* retrnsmt（略過）*/
-	strtoul(p, &p, 16);
-	while (*p == ' ')
-		p++;
-
-	/* uid（十進位）*/
-	*uid_out = (unsigned) strtoul(p, &p, 10);
-	while (*p == ' ')
-		p++;
-
-	/* timeout（略過）*/
-	strtoul(p, &p, 10);
-	while (*p == ' ')
-		p++;
-
-	/* inode */
-	*inode_out = strtoul(p, &p, 10);
+	e->inode = strtoul(p, &p, 10);
 	return 1;
 }
 
@@ -530,289 +214,165 @@ static int parse_proc_line(const char *line,
  * inode → PID 對照表（掃描 /proc/<pid>/fd/）
  * ═══════════════════════════════════════════════════════════════ */
 
-static int imap_cmp(const void *a, const void *b)
+static int cmp_by_inode(const void *a, const void *b)
 {
-	const inode_map_t *ia = a, *ib = b;
-	if (ia->inode < ib->inode)
-		return -1;
-	if (ia->inode > ib->inode)
-		return 1;
-	return 0;
+	const net_entry_t *ea = *(const net_entry_t **) a;
+	const net_entry_t *eb = *(const net_entry_t **) b;
+	return DIAG_CMP(ea->inode, eb->inode);
 }
 
-static void build_inode_map(void)
+static void resolve_pids(void)
 {
-	int proc_fd, pid_fd, comm_fd, fd_dirfd, r;
-	long nread, off, fn, fo;
-	struct linux_dirent64 *d, *fd_d;
-	pid_t pid;
-	char dents_buf[DENTS_BUF];
-	char fd_dents[DENTS_BUF];
-	char comm_buf[32];
-	char link[80];
-	ssize_t lr;
-	unsigned long inode;
-
-	g_imap_cnt = 0;
-	proc_fd = open("/proc", O_RDONLY | O_DIRECTORY);
-	if (proc_fd < 0)
+	if (g_entries_cnt == 0)
 		return;
 
-	while ((nread = syscall(SYS_getdents64, proc_fd, dents_buf, DENTS_BUF)) >
-		   0) {
-		for (off = 0; off < nread;) {
-			d = (struct linux_dirent64 *) (dents_buf + off);
-			off += (long) d->d_reclen;
+	/* 建立以 inode 排序的指標陣列，取代暴力的全系統 mapping */
+	net_entry_t **by_inode = xmalloc(g_entries_cnt * sizeof(*by_inode));
+	for (int i = 0; i < g_entries_cnt; i++)
+		by_inode[i] = &g_entries[i];
 
-			if (!isdigit((unsigned char) d->d_name[0]))
-				continue;
-			pid = (pid_t) atoi(d->d_name);
+	qsort(by_inode, g_entries_cnt, sizeof(*by_inode), cmp_by_inode);
 
-			pid_fd = openat(proc_fd, d->d_name, O_RDONLY | O_DIRECTORY);
-			if (pid_fd < 0)
-				continue;
+	procps_status_t *proc = NULL;
+	struct dirent *entry;
+	DIR *d_fd;
+	char name[64];
+	unsigned baseofs;
+	int unmapped = g_entries_cnt;
 
-			memset(comm_buf, 0, sizeof(comm_buf));
-			comm_fd = openat(pid_fd, "comm", O_RDONLY);
-			if (comm_fd >= 0) {
-				r = read(comm_fd, comm_buf, sizeof(comm_buf) - 1);
-				if (r > 0) {
-					comm_buf[r] = '\0';
-					comm_buf[strcspn(comm_buf, "\n")] = '\0';
-				}
-				close(comm_fd);
-			}
+	while ((proc = procps_scan(proc, PSSCAN_PID | PSSCAN_COMM)) != NULL) {
+		/* 如果所有 Socket 皆已映射完成，略過耗時的 I/O，僅空轉耗盡 procps_scan 以防 Memory Leak */
+		if (unmapped == 0)
+			continue;
 
-			fd_dirfd = openat(pid_fd, "fd", O_RDONLY | O_DIRECTORY);
-			if (fd_dirfd >= 0) {
-				while ((fn = syscall(
-							SYS_getdents64, fd_dirfd, fd_dents, DENTS_BUF)) >
-					   0) {
-					for (fo = 0; fo < fn;) {
-						fd_d = (struct linux_dirent64 *) (fd_dents + fo);
-						fo += (long) fd_d->d_reclen;
-						if (!isdigit((unsigned char) fd_d->d_name[0]))
-							continue;
+		baseofs = sprintf(name, "/proc/%u/fd/", proc->pid);
+		d_fd = opendir(name);
+		if (d_fd) {
+			while ((entry = readdir(d_fd)) != NULL) {
+				char linkbuf[64];
+				ssize_t len;
+				unsigned long inode;
 
-						lr = readlinkat(
-							fd_dirfd, fd_d->d_name, link, sizeof(link) - 1);
-						if (lr <= 0)
-							continue;
-						link[lr] = '\0';
+				if (!isdigit((unsigned char) entry->d_name[0]))
+					continue;
 
-						if (sscanf(link, "socket:[%lu]", &inode) == 1 &&
-							g_imap_cnt < INODE_MAP_MAX) {
-							g_imap[g_imap_cnt].inode = inode;
-							g_imap[g_imap_cnt].pid = pid;
-							safe_strncpy(g_imap[g_imap_cnt].comm,
-										 comm_buf,
-										 sizeof(g_imap[0].comm));
-							g_imap_cnt++;
+				safe_strncpy(name + baseofs, entry->d_name, sizeof(name) - baseofs);
+				/* 直接使用 stack buffer 進行單次 readlink，省去 xmalloc_readlink 的多次 syscall 與記憶體配置 */
+				len = readlink(name, linkbuf, sizeof(linkbuf) - 1);
+				if (len > 0) {
+					linkbuf[len] = '\0';
+					/* 拋棄高耗能的 sscanf，改用 strncmp + strtoul 輕量解析 */
+					if (strncmp(linkbuf, "socket:[", 8) == 0) {
+						inode = strtoul(linkbuf + 8, NULL, 10);
+
+						/* 在我們真正關心的連線中進行二元搜尋 */
+						int lo = 0, hi = g_entries_cnt - 1;
+						while (lo <= hi) {
+							int mid = (lo + hi) / 2;
+							if (by_inode[mid]->inode == inode) {
+								/* 防止 fork 共用 FD 導致重複扣減 */
+								if (by_inode[mid]->pid == 0) {
+									by_inode[mid]->pid = proc->pid;
+									safe_strncpy(by_inode[mid]->comm,
+												 proc->comm,
+												 sizeof(by_inode[mid]->comm));
+									unmapped--;
+								}
+								break;
+							}
+							if (by_inode[mid]->inode < inode)
+								lo = mid + 1;
+							else
+								hi = mid - 1;
 						}
 					}
 				}
-				close(fd_dirfd);
 			}
-			close(pid_fd);
+			closedir(d_fd);
 		}
 	}
-	close(proc_fd);
-
-	if (g_imap_cnt > 1)
-		qsort(g_imap, g_imap_cnt, sizeof(g_imap[0]), imap_cmp);
-}
-
-static void lookup_inode(unsigned long inode,
-						 pid_t *out_pid,
-						 char *out_comm,
-						 size_t commlen)
-{
-	int lo = 0, hi = g_imap_cnt - 1;
-	while (lo <= hi) {
-		int mid = (lo + hi) / 2;
-		if (g_imap[mid].inode == inode) {
-			*out_pid = g_imap[mid].pid;
-			safe_strncpy(out_comm, g_imap[mid].comm, commlen);
-			return;
-		}
-		if (g_imap[mid].inode < inode)
-			lo = mid + 1;
-		else
-			hi = mid - 1;
-	}
-	*out_pid = 0;
-	safe_strncpy(out_comm, "-", commlen);
+	free(by_inode);
 }
 
 /* ═══════════════════════════════════════════════════════════════
  * 解析 /proc/net/{tcp,tcp6,udp,udp6}
  * ═══════════════════════════════════════════════════════════════ */
 
-static net_entry_t *parse_net_file(const char *path,
-								   const char *proto,
-								   int is_ipv6,
-								   int resolve_pid,
-								   int listen_only,
-								   int filter_state,
-								   int target_state)
+static void parse_net_file(const char *path, int is_udp, int is_ipv6)
 {
-	char e_local_tmp[64], e_remote_tmp[64];
-	char *buf = read_proc_net(path);
-	if (!buf)
-		return NULL;
+	FILE *fp = fopen_for_read(path);
+	if (!fp)
+		return;
 
-	net_entry_t *head = NULL, *tail = NULL;
+	/* 提供 64KB 的讀取緩衝區，將原本 4KB 觸發一次的 read syscall 大幅降至每 64KB 觸發一次 */
+	char *io_buf = xmalloc(65536);
+	setvbuf(fp, io_buf, _IOFBF, 65536);
 
+	char line[512];
 	/* 第一行為表頭，直接跳過 */
-	char *line = strchr(buf, '\n');
-	if (line)
-		line++;
-
-	while (line && *line) {
-		char *eol = strchr(line, '\n');
-		if (eol)
-			*eol = '\0';
-
-		int state_hex;
-		unsigned uid;
-		unsigned long inode;
-		uint32_t la4 = 0, ra4 = 0, la6[4] = {0}, ra6[4] = {0};
-		uint16_t lp = 0, rp = 0;
-
-		if (!parse_proc_line_raw(line,
-								 is_ipv6,
-								 &la4,
-								 &lp,
-								 &ra4,
-								 &rp,
-								 la6,
-								 ra6,
-								 &state_hex,
-								 &uid,
-								 &inode))
-			goto next_line;
-
-		if (listen_only && state_hex != 10)
-			goto next_line;
-		if (filter_state && state_hex != target_state)
-			goto next_line;
-
-		{
-			net_entry_t *e = pool_alloc();
-			if (!e)
-				break;
-			safe_strncpy(e->proto, proto, sizeof(e->proto));
-			e->laddr4 = la4;
-			e->raddr4 = ra4;
-			e->lport = lp;
-			e->rport = rp;
-			e->is_ipv6 = (uint8_t) is_ipv6;
-			if (is_ipv6) {
-				memcpy(e->laddr6, la6, 16);
-				memcpy(e->raddr6, ra6, 16);
-			}
-			e->state = state_hex;
-			e->uid = uid;
-			e->inode = inode;
-			if (resolve_pid)
-				lookup_inode(inode, &e->pid, e->comm, sizeof(e->comm));
-			else {
-				e->pid = 0;
-				e->comm[0] = '-';
-				e->comm[1] = '\0';
-			}
-			if (!head)
-				head = e;
-			else
-				tail->next = e;
-			tail = e;
-		}
-
-	next_line:
-		line = eol ? eol + 1 : NULL;
+	if (!fgets(line, sizeof(line), fp)) {
+		fclose(fp);
+		free(io_buf);
+		return;
 	}
-	return head;
-}
 
-static void free_net_list(net_entry_t *head)
-{
-	(void) head;
-	g_pool_idx = 0; /* 重置索引即可，pool 記憶體靜態，無需逐節點 free */
-	g_uid_cache_cnt = 0;
+	while (fgets(line, sizeof(line), fp)) {
+		net_entry_t *e = get_next_entry();
+		e->is_ipv6 = (uint8_t) is_ipv6;
+		e->is_udp = (uint8_t) is_udp;
+
+		if (!parse_proc_line_raw(line, e))
+			continue;
+
+		if (G.listen_only) {
+			if (is_udp) {
+				int remote_is_zero = (e->rport == 0) && 
+					(is_ipv6 ? (e->raddr6[0] == 0 && e->raddr6[1] == 0 && e->raddr6[2] == 0 && e->raddr6[3] == 0) : (e->raddr4 == 0));
+				if (!remote_is_zero)
+					continue;
+			} else if (e->state != 10) {
+				continue;
+			}
+		}
+		if (G.filter_state && e->state != G.target_state)
+			continue;
+
+		e->pid = 0;
+		e->comm[0] = '-';
+		commit_entry();
+	}
+	fclose(fp);
+	free(io_buf);
 }
 
 /* ═══════════════════════════════════════════════════════════════
  * 統計與異常偵測
  * ═══════════════════════════════════════════════════════════════ */
 
-static void count_states(net_entry_t *head, net_stats_t *st)
+static void count_states(net_stats_t *st)
 {
 	memset(st, 0, sizeof(*st));
-	for (net_entry_t *e = head; e; e = e->next) {
-		if (strncmp(e->proto, "udp", 3) == 0) {
+	for (int i = 0; i < g_entries_cnt; i++) {
+		net_entry_t *e = &g_entries[i];
+		if (e->is_udp) {
 			st->udp_total++;
 		} else {
 			st->tcp_total++;
-			if (e->state >= 1 && e->state <= N_TCP_STATES)
+			if (e->state >= 1 && e->state <= DIAG_TCP_STATES_MAX)
 				st->counts[e->state]++;
 		}
 	}
-}
-
-/*
- * 異常偵測閾值（參考 Linux 核心文件與 RFC 793）：
- *   TIME_WAIT > 500  → 高連線週轉率 or tcp_tw_reuse 未啟用
- *   CLOSE_WAIT > 20  → 應用程式未正確關閉 socket（connection leak）
- *   SYN_RECV > 100   → 可能遭受 SYN flood 攻擊
- *   LAST_ACK > 50    → 遠端未回應 FIN-ACK（對端已失聯）
- *   FIN_WAIT2 > 100  → half-open 連線積壓（tcp_fin_timeout 過長）
- *   ESTABLISHED > 10000 → 連線數異常高，可能有資源洩漏
- */
-static void detect_anomalies(const net_stats_t *st)
-{
-	g_warn_cnt = 0;
-
-#define ADD_WARN(fmt, ...)                                                     \
-	do {                                                                       \
-		if (g_warn_cnt < WARN_MAX)                                             \
-			snprintf(                                                          \
-				g_warn[g_warn_cnt++], sizeof(g_warn[0]), fmt, ##__VA_ARGS__);  \
-	} while (0)
-
-	if (st->counts[6] > 500)
-		ADD_WARN("TIME_WAIT=%d (>500): high churn rate or "
-				 "net.ipv4.tcp_tw_reuse not enabled",
-				 st->counts[6]);
-	if (st->counts[8] > 20)
-		ADD_WARN("CLOSE_WAIT=%d (>20): possible connection leak "
-				 "(app not calling close())",
-				 st->counts[8]);
-	if (st->counts[3] > 100)
-		ADD_WARN("SYN_RECV=%d (>100): possible SYN flood attack",
-				 st->counts[3]);
-	if (st->counts[9] > 50)
-		ADD_WARN("LAST_ACK=%d (>50): peer not responding to FIN "
-				 "(network issue or remote crash)",
-				 st->counts[9]);
-	if (st->counts[5] > 100)
-		ADD_WARN("FIN_WAIT2=%d (>100): many half-open connections "
-				 "(check net.ipv4.tcp_fin_timeout)",
-				 st->counts[5]);
-	if (st->counts[1] > 10000)
-		ADD_WARN("ESTABLISHED=%d (>10000): unusually high connection count",
-				 st->counts[1]);
-#undef ADD_WARN
 }
 
 /* ═══════════════════════════════════════════════════════════════
  * 格式化輸出
  * ═══════════════════════════════════════════════════════════════ */
 
-static void print_header(int show_pid, int batch)
+static void print_header(void)
 {
-	const char *eol = batch ? "" : DIAG_CLR_EOL;
+	const char *eol = DIAG_ANSI(G.batch_mode, DIAG_CLR_EOL);
 
-	if (show_pid) {
+	if (G.show_pid) {
 		printf("%-6s %-14s %-42s %-42s %-16s %s%s\n",
 			   "Proto",
 			   "State",
@@ -830,19 +390,12 @@ static void print_header(int show_pid, int batch)
 			   "User",
 			   eol);
 	}
-	if (!batch)
+	if (!G.batch_mode)
 		printf("%.128s%s\n",
 			   "----------------------------------------------"
 			   "----------------------------------------------"
-			   "---------------------------------",
+			   "----------------------------------------------",
 			   DIAG_CLR_EOL);
-}
-
-static void format_ipv4(uint32_t addr, uint16_t port, char *out, size_t outlen)
-{
-	struct in_addr in;
-	in.s_addr = addr;
-	snprintf(out, outlen, "%s:%u", inet_ntoa(in), (unsigned) port);
 }
 
 static void
@@ -855,161 +408,102 @@ format_ipv6(const uint32_t addr6[4], uint16_t port, char *out, size_t outlen)
 	snprintf(out, outlen, "[%s]:%u", ip, (unsigned) port);
 }
 
-static void print_entry(const net_entry_t *e, int show_pid, int batch)
+static void print_entry(const net_entry_t *e)
 {
-	char line[256];
-	char *p = line;
-	const char *state_str, *user;
 	char local[64], remote[64];
-	const char *eol = batch ? "" : DIAG_CLR_EOL;
+	const char *eol = DIAG_ANSI(G.batch_mode, DIAG_CLR_EOL);
 
-	/* proto（最多 6 字元，補空白對齊） */
-	int plen = (int) strlen(e->proto);
-	memcpy(p, e->proto, plen);
-	p += plen;
-	/* 補到 7 字元（6 + 1 空格） */
-	while (plen++ < 7)
-		*p++ = ' ';
-
-	/* state（最多 14 字元） */
-	state_str =
-		(strncmp(e->proto, "udp", 3) == 0) ? "-" : diag_get_tcp_state(e->state);
-	int slen = (int) strlen(state_str);
-	memcpy(p, state_str, slen);
-	p += slen;
-	while (slen++ < 15)
-		*p++ = ' ';
-
-	/* local address（最多 42 字元） */
-	int llen;
 	if (e->is_ipv6) {
 		format_ipv6(e->laddr6, e->lport, local, sizeof(local));
-		llen = (int) strlen(local);
-		memcpy(p, local, llen);
-	} else {
-		llen = fast_format_ipv4(p, e->laddr4, e->lport);
-	}
-	p += llen;
-	while (llen++ < 43)
-		*p++ = ' ';
-
-	/* remote address（最多 42 字元） */
-	int rlen;
-	if (e->is_ipv6) {
 		format_ipv6(e->raddr6, e->rport, remote, sizeof(remote));
-		rlen = (int) strlen(remote);
-		memcpy(p, remote, rlen);
 	} else {
-		rlen = fast_format_ipv4(p, e->raddr4, e->rport);
+		fast_format_ipv4(local, e->laddr4, e->lport);
+		fast_format_ipv4(remote, e->raddr4, e->rport);
 	}
-	p += rlen;
 
-	/* PID 欄（只在 show_pid 時輸出） */
-	if (show_pid) {
-		while (rlen++ < 43)
-			*p++ = ' ';
+	const char *proto_str =
+		e->is_udp ? (e->is_ipv6 ? "udp6" : "udp") : (e->is_ipv6 ? "tcp6" : "tcp");
+	const char *state_str = e->is_udp ? "-" : diag_get_tcp_state(e->state);
+	if (!state_str)
+		state_str = "UNKNOWN";
+	const char *user;
+	char uid_buf[16];
+
+	if (G.numeric) {
+		snprintf(uid_buf, sizeof(uid_buf), "%u", e->uid);
+		user = uid_buf;
+	} else {
+		user = get_cached_username(e->uid);
+	}
+
+	if (G.show_pid) {
+		char pid_comm[32];
 		if (e->pid > 0) {
-			p += fast_uint(p, (unsigned) e->pid);
-			*p++ = '/';
-			int clen = (int) strlen(e->comm);
-			memcpy(p, e->comm, clen);
-			p += clen;
-			int pid_prog_len = (int) (p - line) - (7 + 15 + 43 + 43);
-			while (pid_prog_len++ < 17)
-				*p++ = ' ';
+			snprintf(pid_comm,
+					 sizeof(pid_comm),
+					 "%u/%s",
+					 (unsigned) e->pid,
+					 e->comm);
 		} else {
-			*p++ = '-';
-			int i = 1;
-			while (i++ < 17)
-				*p++ = ' ';
+			strcpy(pid_comm, "-");
 		}
+		printf("%-6s %-14s %-42s %-42s %-16s %s%s\n",
+			   proto_str, state_str, local, remote, pid_comm, user, eol);
 	} else {
-		while (rlen++ < 43)
-			*p++ = ' ';
+		printf("%-6s %-14s %-42s %-42s %s%s\n",
+			   proto_str, state_str, local, remote, user, eol);
 	}
-
-	/* user */
-	user = diag_uid2uname(e->uid);
-	int ulen = (int) strlen(user);
-	memcpy(p, user, ulen);
-	p += ulen;
-
-	/* eol + newline */
-	if (*eol) {
-		memcpy(p, eol, strlen(eol));
-		p += strlen(eol);
-	}
-	*p++ = '\n';
-
-	outbuf_write(line, (int) (p - line));
 }
 
 /* TCP 狀態分布摘要 + 異常警告 */
-static void print_summary(const net_stats_t *st, int batch)
+static void print_summary(const net_stats_t *st)
 {
-	static const char *state_names[] = {NULL,
-										"ESTABLISHED",
-										"SYN_SENT",
-										"SYN_RECV",
-										"FIN_WAIT1",
-										"FIN_WAIT2",
-										"TIME_WAIT",
-										"CLOSE",
-										"CLOSE_WAIT",
-										"LAST_ACK",
-										"LISTEN",
-										"CLOSING"};
-	const char *eol = batch ? "" : DIAG_CLR_EOL;
+	const char *eol = DIAG_ANSI(G.batch_mode, DIAG_CLR_EOL);
 
-	printf("\n%sTCP state summary%s (total=%d)%s%s\n",
-		   batch ? "" : DIAG_CYAN,
-		   batch ? "" : DIAG_RESET,
+	printf("\n%sTCP state summary%s (total=%d)%s\n",
+		   DIAG_ANSI(G.batch_mode, DIAG_CYAN),
+		   DIAG_ANSI(G.batch_mode, DIAG_RESET),
 		   st->tcp_total,
-		   eol,
-		   batch ? "" : DIAG_CLR_EOL);
-	for (int i = 1; i <= 11; i++) {
+		   eol);
+	for (int i = 1; i <= DIAG_TCP_STATES_MAX; i++) {
 		if (st->counts[i] > 0)
-			printf("  %-15s %d%s\n", state_names[i], st->counts[i], eol);
+			printf("  %-15s %d%s\n", diag_get_tcp_state(i), st->counts[i], eol);
 	}
 	if (st->udp_total > 0)
 		printf("UDP total        %d%s\n", st->udp_total, eol);
 
-	if (g_warn_cnt > 0) {
+	/* 異常偵測與警告輸出 */
+	int anomalies = (st->counts[6] > 500) + (st->counts[8] > 20) +
+					(st->counts[3] > 100) + (st->counts[9] > 50) +
+					(st->counts[5] > 100) + (st->counts[1] > 10000);
+
+	if (anomalies > 0) {
 		printf("\n%s[ANOMALY DETECTED]%s%s\n",
-			   batch ? "" : DIAG_RED,
-			   batch ? "" : DIAG_RESET,
+			   DIAG_ANSI(G.batch_mode, DIAG_RED),
+			   DIAG_ANSI(G.batch_mode, DIAG_RESET),
 			   eol);
-		for (int i = 0; i < g_warn_cnt; i++)
-			printf("  %s! %s%s%s\n",
-				   batch ? "" : DIAG_YELLOW,
-				   g_warn[i],
-				   batch ? "" : DIAG_RESET,
-				   eol);
-	}
-}
 
-/* ═══════════════════════════════════════════════════════════════
- * 篩選邏輯
- * ═══════════════════════════════════════════════════════════════ */
+#define PRINT_WARN(fmt, ...) \
+		printf("  %s! " fmt "%s%s\n", \
+			   DIAG_ANSI(G.batch_mode, DIAG_YELLOW), \
+			   ##__VA_ARGS__, \
+			   DIAG_ANSI(G.batch_mode, DIAG_RESET), \
+			   eol)
 
-/*
- * 根據命令列旗標決定是否顯示此 entry：
- *   listen_only=1 → 只顯示 LISTEN (state=10=0x0A)
- *   filter_state=1 → 以 state_str（不分大小寫）比對 TCP 狀態名稱
- */
-static int entry_visible(const net_entry_t *e,
-						 int listen_only,
-						 int filter_state,
-						 const char *state_str)
-{
-	if (listen_only && e->state != 10)
-		return 0;
-	if (filter_state && state_str && *state_str) {
-		const char *es = diag_get_tcp_state(e->state);
-		if (strcasecmp(es, state_str) != 0)
-			return 0;
+		if (st->counts[6] > 500)
+			PRINT_WARN("TIME_WAIT=%d (>500): high churn rate or net.ipv4.tcp_tw_reuse not enabled", st->counts[6]);
+		if (st->counts[8] > 20)
+			PRINT_WARN("CLOSE_WAIT=%d (>20): possible connection leak (app not calling close())", st->counts[8]);
+		if (st->counts[3] > 100)
+			PRINT_WARN("SYN_RECV=%d (>100): possible SYN flood attack", st->counts[3]);
+		if (st->counts[9] > 50)
+			PRINT_WARN("LAST_ACK=%d (>50): peer not responding to FIN (network issue or remote crash)", st->counts[9]);
+		if (st->counts[5] > 100)
+			PRINT_WARN("FIN_WAIT2=%d (>100): many half-open connections (check net.ipv4.tcp_fin_timeout)", st->counts[5]);
+		if (st->counts[1] > 10000)
+			PRINT_WARN("ESTABLISHED=%d (>10000): unusually high connection count", st->counts[1]);
+#undef PRINT_WARN
 	}
-	return 1;
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -1019,234 +513,157 @@ static int entry_visible(const net_entry_t *e,
 /* procfs 資料來源表 */
 static const struct {
 	const char *path;
-	const char *proto;
 	int is_ipv6;
 	int is_udp;
 } g_sources[] = {
-	{"/proc/net/tcp", "tcp", 0, 0},
-	{"/proc/net/tcp6", "tcp6", 1, 0},
-	{"/proc/net/udp", "udp", 0, 1},
-	{"/proc/net/udp6", "udp6", 1, 1},
+	{"/proc/net/tcp", 0, 0},
+	{"/proc/net/tcp6", 1, 0},
+	{"/proc/net/udp", 0, 1},
+	{"/proc/net/udp6", 1, 1},
 };
 
-static void do_scan(int show_tcp,
-					int show_udp,
-					int listen_only,
-					int filter_state,
-					const char *state_str,
-					int show_pid,
-					int batch)
+static void do_scan(void)
 {
-	net_entry_t *list = NULL, *tail = NULL;
-
-	ensure_pool(); /* ← 補上，確保 pool 已初始化 */
-
-	/* 把 state_str 轉成數字，供 parse_net_file 做早期過濾 */
-	int target_state = -1;
-	if (filter_state && state_str && *state_str) {
-		static const char *names[] = {NULL,
-									  "ESTABLISHED",
-									  "SYN_SENT",
-									  "SYN_RECV",
-									  "FIN_WAIT1",
-									  "FIN_WAIT2",
-									  "TIME_WAIT",
-									  "CLOSE",
-									  "CLOSE_WAIT",
-									  "LAST_ACK",
-									  "LISTEN",
-									  "CLOSING"};
-		for (int i = 1; i <= 11; i++)
-			if (strcasecmp(names[i], state_str) == 0) {
-				target_state = i;
-				break;
-			}
-	}
-
-	if (show_pid)
-		build_inode_map();
+	g_entries_cnt = 0;
 
 	for (size_t i = 0; i < ARRAY_SIZE(g_sources); i++) {
-		if (g_sources[i].is_udp && !show_udp)
+		if (g_sources[i].is_udp && !G.show_udp)
 			continue;
-		if (!g_sources[i].is_udp && !show_tcp)
-			continue;
-
-		net_entry_t *part = parse_net_file(g_sources[i].path,
-										   g_sources[i].proto,
-										   g_sources[i].is_ipv6,
-										   show_pid,
-										   listen_only,
-										   filter_state,
-										   target_state);
-		if (!part)
+		if (!g_sources[i].is_udp && !G.show_tcp)
 			continue;
 
-		if (!list)
-			list = part;
-		else
-			tail->next = part;
-		tail = part;
-		while (tail->next)
-			tail = tail->next;
+		parse_net_file(g_sources[i].path,
+					   g_sources[i].is_udp,
+					   g_sources[i].is_ipv6);
 	}
 
-	net_stats_t st;
-	count_states(list, &st);
-	detect_anomalies(&st);
+	if (G.show_pid)
+		resolve_pids();
 
-	print_header(show_pid, batch);
+	net_stats_t st;
+	count_states(&st);
+
+	print_header();
 
 	int printed = 0;
-	for (net_entry_t *e = list; e; e = e->next) {
-		print_entry(e, show_pid, batch);
+	for (int i = 0; i < g_entries_cnt; i++) {
+		print_entry(&g_entries[i]);
 		printed++;
 	}
 
 	if (printed == 0)
-		printf("(no matching connections)%s\n", batch ? "" : DIAG_CLR_EOL);
+		printf("(no matching connections)%s\n", DIAG_ANSI(G.batch_mode, DIAG_CLR_EOL));
 
-	if (show_tcp)
-		print_summary(&st, batch);
+	if (G.show_tcp)
+		print_summary(&st);
 
-	outbuf_flush();
 	fflush(stdout);
-	free_net_list(list);
 }
 
 /* ═══════════════════════════════════════════════════════════════
  * Watch 模式（-w，互動式自動更新）
  * ═══════════════════════════════════════════════════════════════ */
 
-static void do_watch(int show_tcp,
-					 int show_udp,
-					 int listen_only,
-					 int filter_state,
-					 const char *state_str,
-					 int show_pid,
-					 int interval_sec)
+static void do_watch(void)
 {
-	struct termios old_t;
-	struct pollfd pfd = {STDIN_FILENO, POLLIN, 0};
 	char key;
 
-	if (!isatty(STDOUT_FILENO))
-		bb_error_msg_and_die("-w requires a terminal; "
-							 "use -b for non-interactive output");
+	if (!G.batch_mode) {
+		if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO))
+			bb_error_msg_and_die("-w requires a terminal; "
+								 "use -b for non-interactive output");
 
-	diag_ui_mode_raw(&old_t);
-
-	while (1) {
-		/* 非阻塞讀取按鍵 */
-		if (poll(&pfd, 1, 0) > 0 && read(STDIN_FILENO, &key, 1) > 0) {
-			if (toupper((unsigned char) key) == 'Q')
-				break;
-		}
-
-		/* 清屏並印表頭 */
-		printf("\033[H\033[J");
-		printf(DIAG_CYAN "[MY_NET]" DIAG_RESET " Refresh: %ds"
-						 "  TCP:%s UDP:%s Listen-only:%s"
-						 "  Press Q to quit" DIAG_CLR_EOL "\n",
-			   interval_sec,
-			   show_tcp ? "on" : "off",
-			   show_udp ? "on" : "off",
-			   listen_only ? "on" : "off");
-		printf("%.90s" DIAG_CLR_EOL "\n",
-			   "------------------------------------------------------"
-			   "------------------------------------------------------");
-
-		do_scan(show_tcp,
-				show_udp,
-				listen_only,
-				filter_state,
-				state_str,
-				show_pid,
-				0 /* batch=0 → TUI 模式 */);
-
-		fflush(stdout);
-		poll(&pfd, 1, interval_sec * 1000);
+		diag_tui_init();
 	}
 
-	diag_ui_mode_normal(&old_t);
-	printf("\n");
-	fflush(stdout);
+	while (1) {
+		if (!G.batch_mode) {
+			int quit = 0;
+			int res;
+			while ((res = diag_ui_read_key(&key)) > 0) {
+				if (key == 'Q')
+					quit = 1;
+			}
+			if (res < 0 || quit)
+				break;
+
+			/* 清屏並印表頭 */
+			printf(DIAG_CLEAR);
+			printf(DIAG_CYAN "[MY_NET]" DIAG_RESET " Refresh: %ds"
+							 "  TCP:%s UDP:%s Listen-only:%s"
+							 "  Press Q to quit" DIAG_CLR_EOL "\n",
+				   G.interval,
+				   G.show_tcp ? "on" : "off",
+				   G.show_udp ? "on" : "off",
+				   G.listen_only ? "on" : "off");
+			printf("%.128s" DIAG_CLR_EOL "\n",
+				   "------------------------------------------------------"
+				   "------------------------------------------------------"
+				   "------------------------------------------------------");
+		}
+
+		do_scan();
+
+		fflush(stdout);
+		diag_delay(G.interval * 1000, G.batch_mode);
+	}
+
+	if (!G.batch_mode) {
+		diag_tui_restore();
+		printf("\n");
+		fflush(stdout);
+	}
 }
 
 /* ═══════════════════════════════════════════════════════════════
  * main
  * ═══════════════════════════════════════════════════════════════ */
 
+enum {
+	OPT_t = (1 << 0),
+	OPT_u = (1 << 1),
+	OPT_a = (1 << 2),
+	OPT_l = (1 << 3),
+	OPT_n = (1 << 4),
+	OPT_p = (1 << 5),
+	OPT_b = (1 << 6),
+	OPT_s = (1 << 7),
+	OPT_w = (1 << 8),
+};
+
 int my_net_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
 int my_net_main(int argc, char **argv)
 {
 	setvbuf(stdout, NULL, _IOFBF, 65536);
 	char *opt_s = NULL;
-	char *opt_w = NULL;
-	unsigned opts;
-	int opt_t, opt_u, show_all;
-	int show_tcp, show_udp;
-	int listen_only, filter_state, has_watch, batch, show_pid;
-	int interval, is_batch;
+	int interval = 2;
 
-	/*
-     * getopt32 選項字串：t u a l n p b s: w:
-     * bit 0=t  1=u  2=a  3=l  4=n  5=p  6=b  7=s  8=w
-     */
-	opts = getopt32(argv, "tualnpbs:w:", &opt_s, &opt_w);
+	unsigned opts = getopt32(argv, "tualnpbs:w:+", &opt_s, &interval);
 
-	opt_t = (opts & (1 << 0));
-	opt_u = (opts & (1 << 1));
-	show_all = (opts & (1 << 2));
-	listen_only = (opts & (1 << 3));
-	/* bit 4 = n（numeric，保留供未來擴充） */
-	show_pid = (opts & (1 << 5));	  /* -p */
-	batch = (opts & (1 << 6));		  /* -b */
-	filter_state = (opts & (1 << 7)); /* -s */
-	has_watch = (opts & (1 << 8));	  /* -w */
+	G.show_tcp = (opts & OPT_t) || (opts & OPT_a) || (!(opts & OPT_t) && !(opts & OPT_u));
+	G.show_udp = (opts & OPT_u) || (opts & OPT_a);
+	G.listen_only = (opts & OPT_l);
+	G.numeric = (opts & OPT_n);
+	G.show_pid = (opts & OPT_p);
+	G.batch_mode = (opts & OPT_b) || !isatty(STDOUT_FILENO);
+	G.filter_state = (opts & OPT_s);
+	G.interval = (interval < 1) ? 1 : interval;
 
-	if (show_all) {
-		show_tcp = 1;
-		show_udp = 1;
-	} else if (opt_u && !opt_t) {
-		show_tcp = 0;
-		show_udp = 1;
-	} else if (opt_t && opt_u) {
-		show_tcp = 1;
-		show_udp = 1;
-	} else if (opt_t) {
-		show_tcp = 1;
-		show_udp = 0;
-	} else {
-		show_tcp = 1;
-		show_udp = 0; /* 預設：僅 TCP */
+	/* 提早解析狀態字串，避免 Watch 模式下每秒重複解析 */
+	if (G.filter_state && opt_s && *opt_s) {
+		G.target_state = -1;
+		for (int i = 1; i <= DIAG_TCP_STATES_MAX; i++) {
+			if (strcasecmp(diag_get_tcp_state(i), opt_s) == 0) {
+				G.target_state = i;
+				break;
+			}
+		}
 	}
 
-	interval = 2;
-	if (has_watch && opt_w) {
-		interval = atoi(opt_w);
-		if (interval < 1)
-			interval = 1;
-	}
-
-	if (has_watch && !batch) {
-		do_watch(show_tcp,
-				 show_udp,
-				 listen_only,
-				 filter_state,
-				 opt_s ? opt_s : "",
-				 show_pid,
-				 interval);
-	} else {
-		is_batch = batch || !isatty(STDOUT_FILENO);
-		do_scan(show_tcp,
-				show_udp,
-				listen_only,
-				filter_state,
-				opt_s ? opt_s : "",
-				show_pid,
-				is_batch);
-	}
+	if (opts & OPT_w)
+		do_watch();
+	else
+		do_scan();
 
 	return EXIT_SUCCESS;
 }
