@@ -4,9 +4,6 @@
 
 A lightweight system diagnostic toolkit built on the BusyBox architecture. Implements three new applets in C, following POSIX/UNIX command-line interface conventions, compiled into a single static binary, with shared logic extracted into the internal library `libdiag`.
 
-> **Course:** UNIX Systems Programming (Academic Year 114, Semester 2, Course 54015)
-> **Option B · Direction 1 — System Diagnostics Toolkit**
-
 ---
 
 ## Applets Overview
