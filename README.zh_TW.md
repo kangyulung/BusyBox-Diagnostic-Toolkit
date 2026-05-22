@@ -24,6 +24,7 @@
   - macOS: 建議使用 [colima](https://github.com/abiosoft/colima)，也可用 Docker Desktop 等其他 Docker Engine
   - Linux: 直接安裝 Docker Engine 即可
   - Windows: 
+
 - **Bash**（執行 `dev.sh` / `compile.sh` / `format.sh`）
 
 ### 首次建立開發環境
@@ -58,7 +59,7 @@ bash ./compile.sh --fmt
 1. 刪除自動生成的 `my_diag/Config.in` 與 `my_diag/Kbuild`（避免 `INSERT` 殘留）
 2. 清除 `my_diag/` 內所有中間產物（`.o`、`lib.a` 等），保留原始碼與文件
 3. （若傳入 `--fmt`）呼叫 `format.sh`，以 `clang-format -i` 原地格式化 `my_diag/*.c` 與 `my_diag/*.h`
-4. `make defconfig`，並自動啟用靜態連結（與 `dev.sh` 保持一致）；在非 x86 環境（如 ARM64 colima）自動停用 SHA 硬體加速
+4. `make defconfig`，並自動啟用靜態連結；在非 x86 環境（如 ARM64 colima）自動停用 SHA 硬體加速
 5. `make -j$(nproc)` 完整重建
 
 > `format.sh` 也可單獨執行（`bash ./format.sh`），僅做格式化而不觸發編譯。
@@ -81,10 +82,10 @@ bash ./compile.sh --fmt
 - inode 使用率分析（`-i`），相容 `df -i`
 - 雙視角 Use%（使用者視角 / 實際含保留區視角）與 root 保留區資訊（`-r`）
 - 單檔 FIEMAP extent 分析（`-f FILE`），模仿 `filefrag -v` 輸出
-- 掛載點碎片化統計（`-F PATH`），以 nftw 全掃並列出 Top 10 最碎片化檔案
+- 掛載點碎片化統計（`-F PATH`），以 `nftw` 全掃並列出 Top 10 最碎片化檔案
 - 互動式 TUI 即時監控（`-s`）
 
-### 選項摘要
+### 選項
 
 ```
 my_fs [-h] [-i] [-r] [-t TYPE] [-x TYPE] [-f FILE] [-F PATH] [-s] [PATH]...
@@ -135,7 +136,7 @@ my_fs [-h] [-i] [-r] [-t TYPE] [-x TYPE] [-f FILE] [-F PATH] [-s] [PATH]...
 - 互動式操作：執行期間切換視圖、變更排序方式、送出訊號終止行程
 - Batch 模式（關閉終端控制序列，適合日誌記錄或腳本使用）
 
-### 選項摘要
+### 選項
 
 ```
 my_proc [-t] [-d <seconds>] [-n <count>] [-p <pid>] [-b]
@@ -209,9 +210,9 @@ my_proc [-t] [-d <seconds>] [-n <count>] [-p <pid>] [-b]
 - TCP 狀態機追蹤：將核心的十六進位狀態碼解碼為人類可讀名稱（ESTABLISHED、TIME_WAIT、LISTEN 等）
 - 連線異常偵測：每次掃描後比對各狀態計數與閾值，自動警示 SYN flood、連線洩漏、TIME_WAIT 堆積等問題
 - PID/程式名稱解析：以 `getdents64(2)` 直接掃描 `/proc/<pid>/fd/` 建立 inode→PID 映射，二分搜尋達 O(log n) 查找
-- Watch 模式：週期性清除畫面並重新掃描，適合終端機即時監控
+- Watch 模式：週期性更新畫面，適合終端機即時監控
 
-### 選項摘要
+### 選項
 
 ```
 my_net [-t] [-u] [-a] [-l] [-n] [-s STATE] [-w SEC] [-b] [-p]
@@ -220,7 +221,7 @@ my_net [-t] [-u] [-a] [-l] [-n] [-s STATE] [-w SEC] [-b] [-p]
   -u          UDP sockets
   -a          全部（TCP + UDP）
   -l          僅顯示 LISTEN socket
-  -n          數字模式（目前所有位址均以數字輸出）
+  -n          數字模式（所有位址均以數字輸出）
   -s STATE    依 TCP 狀態名稱過濾（不分大小寫）
   -w SEC      Watch 模式，每 SEC 秒更新（最小 1 秒，Q 離開）
   -b          Batch 模式（關閉 ANSI 色彩，適合管線與重導向）
@@ -334,7 +335,7 @@ ss -tn | grep -c ESTAB
 | 狀況 | 解決方式 |
 |------|----------|
 | 首次執行很慢（5–10 分鐘） | 正常，Docker image 需要安裝依賴並完整編譯 |
-| 想在容器外開第二個 shell | `docker exec -it <container_id> bash` |
+| 想再進入同一個容器開第二個 shell | `docker exec -it <container_id> bash` |
 | 修改 `Dockerfile` 但容器沒更新 | `docker build --no-cache -t busybox-dev-env .` |
 
 ---
@@ -345,7 +346,7 @@ ss -tn | grep -c ESTAB
 
 - **禁止直接 push `master`**，須走 `feature/xxx` 或 `fix/xxx` 分支
 - 禁止修改 `my_diag/` 以外的檔案
-- 編碼風格：Tab 縮排、snake_case、`diag_` 前綴
+- 編碼風格：Tab 縮排、snake_case、`diag_` 前綴（內部函式）
 - 新 applet 必須附 man page 與 Bash 測試腳本
 
 ---
