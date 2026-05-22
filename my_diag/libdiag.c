@@ -97,7 +97,7 @@ int diag_read_fs(const char *path, diag_fs_t *f)
 /* 將 TCP 狀態代碼轉換為字串描述 */
 const char *diag_get_tcp_state(int state)
 {
-	static const char *tcp_states[] = {"UNKNOWN",
+	static const char *tcp_states[] = {NULL,
 									   "ESTABLISHED",
 									   "SYN_SENT",
 									   "SYN_RECV",
