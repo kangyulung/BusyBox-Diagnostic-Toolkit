@@ -23,7 +23,7 @@
 - **Docker**
   - macOS: 建議使用 [colima](https://github.com/abiosoft/colima)，也可用 Docker Desktop 等其他 Docker Engine
   - Linux: 直接安裝 Docker Engine 即可
-  - Windows: 
+  - Windows: 建議使用 WSL2 搭配 Docker Desktop
 
 - **Bash**（執行 `dev.sh` / `compile.sh` / `format.sh`）
 
@@ -132,7 +132,7 @@ my_fs [-h] [-i] [-r] [-t TYPE] [-x TYPE] [-f FILE] [-F PATH] [-s] [PATH]...
 
 - 即時行程列表，自動每秒更新 CPU 與記憶體統計
 - 樹狀檢視（依 PPID 關係建構父子階層）
-- 多維度排序（CPU / RSS / VSZ / PID / PPID / User / State / Command）
+- 多維度排序（CPU / RSS / VSZ / PID / PPID / User / SID / Command）
 - 互動式操作：執行期間切換視圖、變更排序方式、送出訊號終止行程
 - Batch 模式（關閉終端控制序列，適合日誌記錄或腳本使用）
 
@@ -161,7 +161,7 @@ my_proc [-t] [-d <seconds>] [-n <count>] [-p <pid>] [-b]
 | `I` | 依 PID 排序 |
 | `O` | 依 PPID 排序 |
 | `U` | 依使用者名稱排序 |
-| `S` | 依行程狀態排序 |
+| `S` | 依 Session ID 排序 |
 | `C` | 依命令名稱排序 |
 
 ### 輸出欄位
@@ -170,7 +170,7 @@ my_proc [-t] [-d <seconds>] [-n <count>] [-p <pid>] [-b]
 |------|------|
 | `PID` | 行程 ID |
 | `PPID` | 父行程 ID |
-| `THR` | 執行緒數 |
+| `SID` | Session ID (階段 ID) |
 | `USER` | 行程擁有者 |
 | `STAT` | 行程狀態（R 執行中、S 休眠、D 不可中斷休眠、Z 殭屍、T 已停止） |
 | `NI` | Nice 值（排程優先度） |
@@ -206,7 +206,7 @@ my_proc [-t] [-d <seconds>] [-n <count>] [-p <pid>] [-b]
 
 ### 功能
 
-- 讀取 `/proc/net/tcp[6]`、`/proc/net/udp[6]` 列出 socket 資訊，輸出格式相容 `ss(8)` 與 `netstat(8)`
+- 讀取 `/proc/net/tcp[6]`、`/proc/net/udp[6]` 列出 socket 資訊
 - TCP 狀態機追蹤：將核心的十六進位狀態碼解碼為人類可讀名稱（ESTABLISHED、TIME_WAIT、LISTEN 等）
 - 連線異常偵測：每次掃描後比對各狀態計數與閾值，自動警示 SYN flood、連線洩漏、TIME_WAIT 堆積等問題
 - PID/程式名稱解析：以 `getdents64(2)` 直接掃描 `/proc/<pid>/fd/` 建立 inode→PID 映射，二分搜尋達 O(log n) 查找
@@ -221,7 +221,7 @@ my_net [-t] [-u] [-a] [-l] [-n] [-s STATE] [-w SEC] [-b] [-p]
   -u          UDP sockets
   -a          全部（TCP + UDP）
   -l          僅顯示 LISTEN socket
-  -n          數字模式（所有位址均以數字輸出）
+  -n          數字模式（不解析使用者名稱，直接顯示 UID）
   -s STATE    依 TCP 狀態名稱過濾（不分大小寫）
   -w SEC      Watch 模式，每 SEC 秒更新（最小 1 秒，Q 離開）
   -b          Batch 模式（關閉 ANSI 色彩，適合管線與重導向）

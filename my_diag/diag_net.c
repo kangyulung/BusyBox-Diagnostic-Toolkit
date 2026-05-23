@@ -7,7 +7,6 @@
 //config:     Network connection state monitor: TCP/UDP socket listing,
 //config:     TCP state machine tracking, connection anomaly detection.
 //config:     Reads /proc/net/tcp[6] and /proc/net/udp[6].
-//config:     Compatible with ss(8) and netstat(8) output format.
 
 //applet:IF_MY_NET(APPLET(my_net, BB_DIR_USR_BIN, BB_SUID_DROP))
 
@@ -21,7 +20,7 @@
 //usage:     "\n	-u		UDP sockets"
 //usage:     "\n	-a		All sockets (TCP + UDP)"
 //usage:     "\n	-l		Listening sockets only"
-//usage:     "\n	-n		Numeric output (no hostname resolution)"
+//usage:     "\n	-n		Numeric output (show UID instead of username)"
 //usage:     "\n	-s STATE	Filter by TCP state (ESTABLISHED, TIME_WAIT, LISTEN, ...)"
 //usage:     "\n	-w SEC		Watch mode: auto-refresh every SEC seconds (Q to quit)"
 //usage:     "\n	-b		Batch mode (plain text output, suitable for scripts)"

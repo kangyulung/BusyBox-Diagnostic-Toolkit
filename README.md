@@ -23,8 +23,8 @@ A lightweight system diagnostic toolkit built on the BusyBox architecture. Imple
 - **Docker**
   - macOS: [colima](https://github.com/abiosoft/colima) is recommended; Docker Desktop and other Docker Engines also work
   - Linux: Install Docker Engine directly
-  - Windows: 
-  
+  - Windows: WSL2 with Docker Desktop is recommended
+
 - **Bash** (to run `dev.sh` / `compile.sh` / `format.sh`)
 
 ### First-Time Setup
@@ -132,7 +132,7 @@ my_fs [-h] [-i] [-r] [-t TYPE] [-x TYPE] [-f FILE] [-F PATH] [-s] [PATH]...
 
 - Real-time process list with automatic per-second updates of CPU and memory statistics
 - Tree view built from PPID relationships to visualize parent-child hierarchies
-- Multi-dimensional sorting (CPU / RSS / VSZ / PID / PPID / User / State / Command)
+- Multi-dimensional sorting (CPU / RSS / VSZ / PID / PPID / User / SID / Command)
 - Interactive operations: switch views, change sort order, and send signals to terminate processes at runtime
 - Batch mode (disables terminal control sequences; suitable for logging or scripting)
 
@@ -161,7 +161,7 @@ my_proc [-t] [-d <seconds>] [-n <count>] [-p <pid>] [-b]
 | `I` | Sort by PID |
 | `O` | Sort by PPID |
 | `U` | Sort by username |
-| `S` | Sort by process state |
+| `S` | Sort by Session ID |
 | `C` | Sort by command name |
 
 ### Output Columns
@@ -170,7 +170,7 @@ my_proc [-t] [-d <seconds>] [-n <count>] [-p <pid>] [-b]
 |--------|-------------|
 | `PID` | Process ID |
 | `PPID` | Parent process ID |
-| `THR` | Thread count |
+| `SID` | Session ID |
 | `USER` | Process owner |
 | `STAT` | Process state (R: Running, S: Sleeping, D: Uninterruptible sleep, Z: Zombie, T: Stopped) |
 | `NI` | Nice value (scheduling priority) |
@@ -206,7 +206,7 @@ my_proc [-t] [-d <seconds>] [-n <count>] [-p <pid>] [-b]
 
 ### Features
 
-- Reads `/proc/net/tcp[6]` and `/proc/net/udp[6]` to list socket information; output format is compatible with `ss(8)` and `netstat(8)`
+- Reads `/proc/net/tcp[6]` and `/proc/net/udp[6]` to list socket information
 - TCP state machine tracking: decodes the kernel's hex state codes into human-readable names (ESTABLISHED, TIME_WAIT, LISTEN, etc.)
 - Connection anomaly detection: after each scan, compares per-state counts against thresholds and warns of SYN floods, connection leaks, TIME_WAIT accumulation, and more
 - PID/program name resolution: builds an inode→PID map by scanning `/proc/<pid>/fd/` with `getdents64(2)` directly; binary search provides O(log n) lookup
@@ -221,7 +221,7 @@ my_net [-t] [-u] [-a] [-l] [-n] [-s STATE] [-w SEC] [-b] [-p]
   -u          UDP sockets
   -a          All sockets (TCP + UDP)
   -l          Listening sockets only
-  -n          Numeric mode (all addresses are printed numerically)
+  -n          Numeric mode (shows UID instead of username)
   -s STATE    Filter by TCP state name (case-insensitive)
   -w SEC      Watch mode: refresh every SEC seconds (minimum 1; press Q to quit)
   -b          Batch mode (disables ANSI color; suitable for pipes and redirection)
