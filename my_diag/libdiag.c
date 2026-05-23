@@ -6,8 +6,8 @@
 #include <fcntl.h>
 #include <sys/sysinfo.h>
 
-/* 從 /proc/stat 讀取 CPU 總體時間標記 (CPU ticks) */
-unsigned long long get_cpu_usage_ticks(void)
+/* Read total CPU time ticks from /proc/stat */
+static unsigned long long get_cpu_usage_ticks(void)
 {
 	unsigned long long utime = 0, ntime = 0, stime = 0, itime = 0;
 	unsigned long long iowtime = 0, irq = 0, sirq = 0, steal = 0;
@@ -17,7 +17,7 @@ unsigned long long get_cpu_usage_ticks(void)
 		return 0;
 
 	if (fgets(buf, sizeof(buf), fp)) {
-		/* 解析 /proc/stat 的第一行 (cpu 總計) */
+		/* Parse the first line of /proc/stat (cpu total) */
 		if (sscanf(buf,
 				   "cpu %llu %llu %llu %llu %llu %llu %llu %llu",
 				   &utime,
@@ -36,7 +36,7 @@ unsigned long long get_cpu_usage_ticks(void)
 	return utime + ntime + stime + itime + iowtime + irq + sirq + steal;
 }
 
-/* 將 CPU 時間標記轉換為人類可讀的格式 (HH:MM:SS 或 MM:SS.cc) */
+/* Convert CPU time ticks to human-readable format (HH:MM:SS or MM:SS.cc) */
 char *
 diag_format_time(char *buf, unsigned long long utime, unsigned long long stime)
 {
@@ -57,9 +57,9 @@ diag_format_time(char *buf, unsigned long long utime, unsigned long long stime)
 	return buf;
 }
 
-/* --- 檔案系統與連線監測 --- */
+/* --- Filesystem and Connection Monitoring --- */
 
-/* 取得指定路徑的檔案系統使用狀況 (Inodes 與 磁碟空間) */
+/* Get filesystem usage (inodes and disk space) for the specified path */
 int diag_read_fs(const char *path, diag_fs_t *f)
 {
 	struct statfs s;
@@ -68,14 +68,14 @@ int diag_read_fs(const char *path, diag_fs_t *f)
 
 	f->total_inodes = s.f_files;
 	f->free_inodes = s.f_ffree;
-	/* f_frsize 是實際片段大小，df 用此欄位計算；f_bsize 是最佳傳輸大小，virtiofs 等 fs 兩者差距可達 256x */
+	/* f_frsize is the actual fragment size used by df; f_bsize is optimal transfer size, can differ by 256x in virtiofs etc. */
 	f->total_bytes = (uint64_t) s.f_blocks * s.f_frsize;
 	f->free_bytes = (uint64_t) s.f_bavail * s.f_frsize;
 	f->free_bytes_priv = (uint64_t) s.f_bfree * s.f_frsize;
 	return 0;
 }
 
-/* 將 TCP 狀態代碼轉換為字串描述 */
+/* Convert TCP state code to string description */
 const char *diag_get_tcp_state(int state)
 {
 	static const char *tcp_states[] = {NULL,
@@ -95,9 +95,9 @@ const char *diag_get_tcp_state(int state)
 	return tcp_states[state];
 }
 
-/* --- 檔案碎片分析（服務 diag_fs）--- */
+/* --- File Fragmentation Analysis (for diag_fs) --- */
 
-/* 一次 ioctl 能容納的 extent 數量上限；涵蓋絕大多數真實檔案 */
+/* Max number of extents for a single ioctl; covers the vast majority of real files */
 #define FIEMAP_INIT_COUNT 512
 
 int diag_read_fragmentation(const char *path,
@@ -110,7 +110,7 @@ int diag_read_fragmentation(const char *path,
 
 	memset(f, 0, sizeof(*f));
 
-	/* O_NOFOLLOW：不追蹤符號連結，避免意外跨越掛載點 */
+	/* O_NOFOLLOW: Do not follow symlinks, preventing accidental traversal across mount points */
 	fd = open(path, O_RDONLY | O_NOFOLLOW);
 	if (fd < 0)
 		return -1;
@@ -128,26 +128,25 @@ int diag_read_fragmentation(const char *path,
 	f->block_size = (uint32_t) sb.st_blksize;
 
 	if (!collect_extents) {
-		/* count-only 路徑（-F 目錄掃描）：fm_extent_count=0 讓核心只回傳總數 */
-		fm = xzalloc(sizeof(*fm));
-		fm->fm_start = 0;
-		fm->fm_length = FIEMAP_MAX_OFFSET;
-		fm->fm_flags = 0;
-		fm->fm_extent_count = 0;
-		if (ioctl(fd, FS_IOC_FIEMAP, fm) != 0) {
-			free(fm);
+		/* count-only path (-F directory scan): fm_extent_count=0 tells kernel to return only the total count */
+		struct fiemap fm_stack;
+		memset(&fm_stack, 0, sizeof(fm_stack));
+		fm_stack.fm_start = 0;
+		fm_stack.fm_length = FIEMAP_MAX_OFFSET;
+		fm_stack.fm_flags = 0;
+		fm_stack.fm_extent_count = 0;
+		if (ioctl(fd, FS_IOC_FIEMAP, &fm_stack) != 0) {
 			close(fd);
 			return -1;
 		}
-		f->extent_count = fm->fm_mapped_extents;
-		free(fm);
+		f->extent_count = fm_stack.fm_mapped_extents;
 		close(fd);
 		return 0;
 	}
 
-	/* collect_extents=1（-f 單檔）：先用大 buffer 嘗試單次 ioctl。
-     * 若最後一個 extent 帶有 FIEMAP_EXTENT_LAST，代表全部取回；
-     * 否則 buffer 不足，退回 count-only + 精確大小的第二次呼叫。 */
+	/* collect_extents=1 (-f single file): try single ioctl with large buffer first.
+	 * If the last extent has FIEMAP_EXTENT_LAST, all are retrieved;
+	 * Otherwise, buffer is insufficient, fallback to count-only + exact size second call. */
 	size_t sz = sizeof(*fm) + sizeof(struct fiemap_extent) * FIEMAP_INIT_COUNT;
 	fm = xzalloc(sz);
 	fm->fm_start = 0;
@@ -161,13 +160,13 @@ int diag_read_fragmentation(const char *path,
 		return -1;
 	}
 
-	/* 判斷是否已取得全部 extent */
+	/* Determine if all extents have been retrieved */
 	int all_done = (fm->fm_mapped_extents == 0) ||
 				   (fm->fm_extents[fm->fm_mapped_extents - 1].fe_flags &
 					FIEMAP_EXTENT_LAST);
 
 	if (!all_done) {
-		/* fallback：extent 數超過 FIEMAP_INIT_COUNT，用兩次呼叫取完 */
+		/* fallback: number of extents exceeds FIEMAP_INIT_COUNT, retrieve in two calls */
 		uint32_t total;
 		free(fm);
 		fm = xzalloc(sizeof(*fm));
@@ -208,6 +207,7 @@ int diag_read_fragmentation(const char *path,
 	return 0;
 }
 
+/* Frees dynamically allocated memory within a fragmentation structure */
 void diag_free_frag(diag_frag_t *f)
 {
 	if (f && f->extents) {
@@ -215,9 +215,9 @@ void diag_free_frag(diag_frag_t *f)
 		f->extents = NULL;
 	}
 }
-/* --- 系統快照 (Memory & Load) --- */
+/* --- System Snapshot (Memory & Load) --- */
 
-/* 獲取當前系統資源快照，包含記憶體、負載與 CPU 標記 */
+/* Get current system resource snapshot, including memory, load, and CPU ticks */
 void diag_get_sys_snap(diag_sys_snap_t *snap)
 {
 	memset(snap, 0, sizeof(*snap));
@@ -234,29 +234,12 @@ void diag_get_sys_snap(diag_sys_snap_t *snap)
 	snap->cpu_total_ticks = get_cpu_usage_ticks();
 }
 
-/* --- UI 終端模式切換 --- */
-
-/* 切換至 Raw 模式 (禁用緩衝與回顯)，用於即時監控介面 */
-void diag_ui_mode_raw(struct termios *old_t)
-{
-
-	set_termios_to_raw(STDIN_FILENO, old_t, 0);
-	printf(DIAG_HIDE DIAG_CLR_SCR);
-	fflush(stdout);
-}
-
-/* 恢復標準終端模式並顯示游標 */
-void diag_ui_mode_normal(struct termios *old_t)
-{
-
-	printf(DIAG_SHOW);
-	tcsetattr(STDIN_FILENO, TCSANOW, old_t);
-	fflush(stdout);
-}
+/* --- UI Terminal Mode Switching --- */
 
 static struct termios g_tui_saved_termios;
 static volatile sig_atomic_t g_tui_active = 0;
 
+/* Restores the terminal to its normal state, exiting raw mode and showing the cursor */
 void diag_tui_restore(void)
 {
 	static const char show_cursor[] = DIAG_SHOW;
@@ -267,8 +250,13 @@ void diag_tui_restore(void)
 	write(STDOUT_FILENO, show_cursor, sizeof(show_cursor) - 1);
 }
 
-static void diag_tui_atexit(void) { diag_tui_restore(); }
+/* atexit handler to ensure terminal restoration upon normal exit */
+static void diag_tui_atexit(void)
+{
+	diag_tui_restore();
+}
 
+/* Signal handler to ensure terminal restoration upon abnormal termination */
 static void diag_tui_sig_handler(int sig)
 {
 	diag_tui_restore();
@@ -276,6 +264,7 @@ static void diag_tui_sig_handler(int sig)
 	raise(sig);
 }
 
+/* Initializes the terminal for TUI mode (enters raw mode and hides the cursor) */
 void diag_tui_init(void)
 {
 	static int registered = 0;
@@ -292,7 +281,7 @@ void diag_tui_init(void)
 	}
 }
 
-/* 在 UI 執行期間提示使用者輸入整數 (會暫時恢復正常終端模式) */
+/* Prompt user for integer input during UI execution (temporarily restores normal terminal mode) */
 int diag_ui_ask_int(const char *prompt)
 {
 
@@ -310,6 +299,11 @@ int diag_ui_ask_int(const char *prompt)
 	return res;
 }
 
+/*
+ * Non-blocking read of a single key press from standard input.
+ * Converts to uppercase before returning.
+ * Returns 1 on successful read, 0 if no input is ready, -1 on error/EOF.
+ */
 int diag_ui_read_key(char *out_key)
 {
 	struct pollfd pfd = {STDIN_FILENO, POLLIN, 0};
@@ -327,11 +321,11 @@ int diag_ui_read_key(char *out_key)
 		return 0;
 	}
 
-	*out_key = (char) toupper((unsigned char)c);
+	*out_key = (char) toupper((unsigned char) c);
 	return 1;
 }
 
-/* 二元搜尋輔助函式：根據 ID 搜尋節點 */
+/* Binary search helper: search for node by ID */
 diag_node_base_t *diag_find_node(diag_node_base_t **arr, int size, int id)
 {
 	int low = 0, high = size - 1;
@@ -347,7 +341,7 @@ diag_node_base_t *diag_find_node(diag_node_base_t **arr, int size, int id)
 	return NULL;
 }
 
-/* 排序比較函式：根據 ID 升序排序 */
+/* Sorting comparison function: ascending order by ID */
 int diag_node_cmp(const void *a, const void *b)
 {
 	int id_a = (*(diag_node_base_t **) a)->id;
@@ -355,7 +349,7 @@ int diag_node_cmp(const void *a, const void *b)
 	return DIAG_CMP(id_a, id_b);
 }
 
-/* 將鏈結串列轉換為指標陣列以便於排序與隨機存取 */
+/* Convert linked list to pointer array for easy sorting and random access */
 diag_node_base_t **diag_nodes_to_array(diag_node_base_t *list, int *out_cnt)
 {
 	int cnt = 0;
@@ -383,7 +377,7 @@ diag_node_base_t **diag_nodes_to_array(diag_node_base_t *list, int *out_cnt)
 	return arr;
 }
 
-/* 根據 parent_id 將扁平串列重組為樹狀結構 */
+/* Reconstruct flat list into a tree structure based on parent_id */
 diag_node_base_t *diag_link_tree(diag_node_base_t **nodes, int count)
 {
 
@@ -398,11 +392,11 @@ diag_node_base_t *diag_link_tree(diag_node_base_t **nodes, int count)
 				: NULL;
 
 		if (parent && parent != curr) {
-			/* 建立親子關聯 */
+			/* Establish parent-child relationship */
 			curr->sibling = parent->child;
 			parent->child = curr;
 		} else {
-			/* 無父節點或指向自身者歸類為根節點 */
+			/* Nodes without a parent or pointing to themselves are classified as root nodes */
 			curr->sibling = root_list;
 			root_list = curr;
 		}
@@ -410,6 +404,7 @@ diag_node_base_t *diag_link_tree(diag_node_base_t **nodes, int count)
 	return root_list;
 }
 
+/* Frees the memory allocated for a linked list of nodes */
 void diag_free_node_list(diag_node_base_t *head)
 {
 	while (head) {
@@ -422,8 +417,8 @@ void diag_free_node_list(diag_node_base_t *head)
 void diag_delay(int ms, int batch_mode)
 {
 	if (batch_mode) {
-		/* Batch 模式不依賴互動，純休眠以免讀到 EOF 引發 100% CPU 空轉 */
-		usleep((useconds_t)ms * 1000);
+		/* Batch mode does not rely on interaction, sleep only to avoid 100% CPU spinning on EOF */
+		usleep((useconds_t) ms * 1000);
 	} else {
 		struct pollfd pfd = {STDIN_FILENO, POLLIN, 0};
 		safe_poll(&pfd, 1, ms);

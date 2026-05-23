@@ -4,85 +4,90 @@
 #include "libbb.h"
 #include <linux/fiemap.h>
 
-/* ANSI 控制序列：用於 UI 渲染 */
-#define DIAG_CLR_EOL "\033[K" /* 清除至行尾 */
-#define DIAG_CLR_SCR "\033[H" /* 游標移至左上角 */
-#define DIAG_CLEAR "\033[H\033[J" /* 游標移至左上角並清除整個螢幕 */
-#define DIAG_CLR_DOWN "\033[J" /* 清除游標位置到螢幕底部的內容 */
-#define DIAG_INVERT "\e[7m"    /* 反白顯示 */
-#define DIAG_RESET "\e[0m"	  /* 重置顏色與格式 */
+/* ANSI control sequences for UI rendering */
+#define DIAG_CLR_EOL "\033[K" /* Clear to end of line */
+#define DIAG_CLR_SCR "\033[H" /* Move cursor to top-left corner */
+#define DIAG_CLEAR                                                             \
+	"\033[H\033[J" /* Move cursor to top-left and clear the entire screen */
+#define DIAG_CLR_DOWN "\033[J" /* Clear from cursor to bottom of screen */
+#define DIAG_INVERT "\e[7m"	   /* Inverse video (highlight) */
+#define DIAG_RESET "\e[0m"	   /* Reset color and formatting */
 #define DIAG_RED "\e[1;31m"
 #define DIAG_GREEN "\e[1;32m"
 #define DIAG_YELLOW "\e[1;33m"
 #define DIAG_CYAN "\e[1;36m"
-#define DIAG_HIDE "\033[?25l" /* 隱藏游標 */
-#define DIAG_SHOW "\033[?25h" /* 顯示游標 */
+#define DIAG_HIDE "\033[?25l" /* Hide cursor */
+#define DIAG_SHOW "\033[?25h" /* Show cursor */
 
-/* 批次模式安全格式化 (Batch 模式輸出空字串，否則輸出 ANSI 控制碼) */
+/* Safe formatting for batch mode (outputs empty string in batch mode, otherwise ANSI codes) */
 #define DIAG_ANSI(batch, ansi) ((batch) ? "" : (ansi))
 
-/* 安全比較巨集，回傳 -1, 0, 1 (避免相減溢位並簡化 qsort 比較) */
+/* Safe comparison macro, returns -1, 0, 1 (prevents subtraction overflow and simplifies qsort comparison) */
 #define DIAG_CMP(a, b) (((a) > (b)) - ((a) < (b)))
 
-/* TCP 狀態數量上限 */
+/* Maximum number of TCP states */
 #define DIAG_TCP_STATES_MAX 11
 
-/* 樹狀結構基礎節點：用於建立行程間的父子關係 */
+/* Tree structure base node: used to establish parent-child relationships between processes */
 typedef struct diag_node_base {
-	int id;							/* 節點唯一識別碼 (如 PID) */
-	int parent_id;					/* 父節點識別碼 (如 PPID) */
-	struct diag_node_base *child;	/* 第一個子節點 */
-	struct diag_node_base *sibling; /* 下一個兄弟節點 */
-	struct diag_node_base *next; /* 線性鏈表指標，用於遍歷所有節點 */
+	int id;							/* Unique node identifier (e.g., PID) */
+	int parent_id;					/* Parent node identifier (e.g., PPID) */
+	struct diag_node_base *child;	/* First child node */
+	struct diag_node_base *sibling; /* Next sibling node */
+	struct diag_node_base
+		*next; /* Linear linked list pointer for iterating through all nodes */
 } diag_node_base_t;
 
-/* 檔案系統資訊結構 (統計磁碟使用狀況) */
+/* File system information structure (disk usage statistics) */
 typedef struct {
 	unsigned long total_inodes;
 	unsigned long free_inodes;
-	uint64_t total_bytes;	  /* 總容量 */
-	uint64_t free_bytes;	  /* 非 root 用戶可用空間 */
-	uint64_t free_bytes_priv; /* 含 root 保留區的剩餘空間 */
+	uint64_t total_bytes; /* Total capacity in bytes */
+	uint64_t free_bytes;  /* Free space available to non-root users */
+	uint64_t
+		free_bytes_priv; /* Total free space including root-reserved blocks */
 } diag_fs_t;
 
-/* 單檔碎片分析結果 */
+/* Single file fragmentation analysis results */
 typedef struct {
-	uint64_t file_size;	   /* 檔案大小（bytes） */
-	uint32_t extent_count; /* extent 總數 */
+	uint64_t file_size;	   /* File size in bytes */
+	uint32_t extent_count; /* Total number of extents */
 	uint32_t
-		block_size; /* fstat.st_blksize；caller 用於 byte↔block 換算，免再呼叫 statfs */
-	struct fiemap_extent
-		*extents; /* 詳細清單；NULL 表示未收集（需呼叫 diag_free_frag 釋放） */
+		block_size; /* fstat.st_blksize; used by caller for byte-block conversions without calling statfs */
+	struct fiemap_extent *
+		extents; /* Detailed list of extents; NULL if not collected (requires diag_free_frag to free) */
 } diag_frag_t;
 
-/* 通用解析工具 */
-/* 系統狀態快照 (全域統計) */
+/* System state snapshot (global statistics) */
 typedef struct {
 	unsigned long total_mem_kb;
 	unsigned long free_mem_kb;
-	double load_avg[3];					/* 1, 5, 15 分鐘平均負載 */
-	unsigned long long cpu_total_ticks; /* CPU 累計總滴答數 */
+	double load_avg[3];					/* 1, 5, 15 minute load averages */
+	unsigned long long cpu_total_ticks; /* Total accumulated CPU ticks */
 } diag_sys_snap_t;
 
-/* 通用解析與格式化工具 */
-unsigned long long get_cpu_usage_ticks(void);
+/* General parsing and formatting utilities */
 char *
 diag_format_time(char *buf, unsigned long long utime, unsigned long long stime);
 
-/* 系統資訊採集函數 */
+/* System information collection functions */
 int diag_read_fs(const char *path, diag_fs_t *f);
 const char *diag_get_tcp_state(int state);
 void diag_get_sys_snap(diag_sys_snap_t *snap);
 
-/* 終端 UI 模式控制 */
-void diag_ui_mode_raw(struct termios *old); /* 開啟 Raw mode 以處理單鍵輸入 */
-void diag_ui_mode_normal(struct termios *old); /* 恢復標準終端模式 */
-void diag_tui_init(void);                /* 開啟 TUI (Raw mode、隱藏游標、註冊 cleanup) */
-void diag_tui_restore(void);             /* 關閉 TUI (恢復游標與終端模式) */
-int diag_ui_ask_int(const char *prompt); /* 彈出式詢問數值 (會自動暫停與恢復 TUI) */
-int diag_ui_read_key(char *out_key);     /* 讀取單一按鍵（自動過濾 ESC 序列） */
+/* Terminal UI mode controls */
+void diag_tui_init(
+	void); /* Initialize TUI (raw mode, hide cursor, register cleanup) */
+void diag_tui_restore(
+	void); /* Restore TUI (restore cursor and terminal mode) */
+int diag_ui_ask_int(
+	const char *
+		prompt); /* Prompt for an integer value (automatically pauses and restores TUI) */
+int diag_ui_read_key(
+	char *
+		out_key); /* Read a single keypress (automatically filters ESC sequences) */
 
-/* 樹狀結構建構工具 */
+/* Tree structure building utilities */
 diag_node_base_t **diag_nodes_to_array(diag_node_base_t *list, int *out_cnt);
 diag_node_base_t *diag_link_tree(diag_node_base_t **nodes, int count);
 diag_node_base_t *diag_find_node(diag_node_base_t **arr, int size, int id);
@@ -90,17 +95,17 @@ int diag_node_cmp(const void *a, const void *b);
 void diag_free_node_list(diag_node_base_t *head);
 
 /*
- * 對單一正規檔案執行 FIEMAP ioctl，填入 f->file_size 與 f->extent_count。
- * collect_extents=1 → 同時填充 f->extents（動態配置，需呼叫 diag_free_frag 釋放）
- * collect_extents=0 → f->extents 保持 NULL，僅取 extent_count
- * 回傳 0 成功、-1 失敗（errno 已設定）；path 為目錄或不支援 FIEMAP 的 fs 均回傳 -1
+ * Executes FIEMAP ioctl on a single regular file, filling f->file_size and f->extent_count.
+ * collect_extents=1 -> also populates f->extents (dynamically allocated, must call diag_free_frag to free)
+ * collect_extents=0 -> f->extents remains NULL, only retrieves extent_count
+ * Returns 0 on success, -1 on failure (errno is set); returns -1 if path is a directory or unsupported fs
  */
 int diag_read_fragmentation(const char *path,
 							diag_frag_t *f,
 							int collect_extents);
 void diag_free_frag(diag_frag_t *f);
 
-/* 統一的等待與輪詢函式 (Batch 模式純休眠，TUI 模式則 polling stdin) */
+/* Unified wait and polling function (pure sleep in batch mode, polls stdin in TUI mode) */
 void diag_delay(int ms, int batch_mode);
 
 #endif

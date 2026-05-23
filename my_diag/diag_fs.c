@@ -24,20 +24,9 @@
 //usage:     "\n	-s		Interactive TUI (D=disk I=inode R=reserved F=frag H=human Q=quit)"
 // clang-format on
 
-#include "libbb.h"
 #include "libdiag.h"
 #include <ftw.h>
 #include <mntent.h>
-#include <termios.h>
-#include <ctype.h>
-#include <signal.h>
-
-/* Move the cursor home and clear the screen.
- * DIAG_CLR_SCR only emits "\033[H" and is shared with my_proc,
- * so keep its behavior unchanged and append "\033[J" locally.
- * This macro is private to diag_fs.c to avoid scattering raw ANSI
- * escape strings across the file. */
-#define MYFS_CLR_SCREEN DIAG_CLR_SCR "\033[J"
 
 /* Mount list node parsed from the mount table.
  * The three strings are allocated with xstrdup() and freed by
@@ -57,7 +46,6 @@ typedef struct mount_node {
 typedef struct {
 	char *device;
 	char *path;
-	char *fstype;
 	/* Block usage fields, used by the default view. */
 	uint64_t total_1k;
 	uint64_t used_1k;
@@ -69,10 +57,49 @@ typedef struct {
 	unsigned long free_inodes;
 	unsigned iuse_pct; /* Ceiling-rounded. */
 	/* Dual-perspective fields, used by -r. */
-	uint64_t rootresv_1k;  /* (f_bfree - f_bavail) * f_frsize / 1024 */
-	unsigned use_pct_real; /* ceiling(used_real / total * 100), including reserved blocks */
+	uint64_t rootresv_1k; /* (f_bfree - f_bavail) * f_frsize / 1024 */
+	unsigned
+		use_pct_real; /* ceiling(used_real / total * 100), including reserved blocks */
 } fs_entry_t;
 
+/* L2: mounted-filesystem fragmentation statistics for -F PATH. */
+#define L2_TOP_N 10
+
+struct l2_top_entry {
+	char path[PATH_MAX];
+	uint32_t extents;
+};
+
+struct l2_ctx {
+	uint64_t total;
+	uint64_t frag;
+	uint64_t skipped; /* FTW_F entries where FIEMAP failed... */
+	uint64_t dist[4]; /* [0]=1, [1]=2-4, [2]=5-16, [3]=17+ extents */
+	struct l2_top_entry top[L2_TOP_N];
+	int top_count;
+};
+
+typedef enum {
+	FS_VIEW_DF,
+	FS_VIEW_INODE,
+	FS_VIEW_RESERVED,
+	FS_VIEW_FRAG,
+} fs_view_t;
+
+typedef struct {
+	fs_view_t view_mode;
+	bool human;
+	bool is_tui;
+	bool frag_ready;
+	struct l2_ctx frag_cache;
+	mount_node_t *mount_cache;
+	time_t mount_cache_ts;
+	struct l2_ctx l2;
+} fs_ctx_t;
+
+static fs_ctx_t G;
+
+/* Frees the dynamically allocated strings inside an fs_entry_t */
 static void free_fs_entry(fs_entry_t *e)
 {
 	if (!e)
@@ -81,8 +108,6 @@ static void free_fs_entry(fs_entry_t *e)
 	e->device = NULL;
 	free(e->path);
 	e->path = NULL;
-	free(e->fstype);
-	e->fstype = NULL;
 }
 
 /* Parse the mount table and return a linked list in file order.
@@ -127,6 +152,12 @@ static void free_mount_list(mount_node_t *head)
 	}
 }
 
+/* Calculate percentage with ceiling rounding, matching df's Use% calculation */
+static unsigned calc_use_pct(uint64_t used, uint64_t total)
+{
+	return (total > 0) ? (unsigned) ((used * 100 + total - 1) / total) : 0;
+}
+
 /* Read raw filesystem data with diag_read_fs() and derive display fields. */
 static int get_fs_entry(const char *path, fs_entry_t *e)
 {
@@ -143,10 +174,7 @@ static int get_fs_entry(const char *path, fs_entry_t *e)
 	e->total_1k = fs.total_bytes / 1024;
 	e->used_1k = used / 1024;
 	e->avail_1k = avail / 1024;
-	/* ceiling(used / nonr_tot * 100), matching df's Use% calculation */
-	e->use_pct = (nonr_tot > 0)
-					 ? (unsigned) ((used * 100 + nonr_tot - 1) / nonr_tot)
-					 : 0;
+	e->use_pct = calc_use_pct(used, nonr_tot);
 
 	/* Inode fields. */
 	unsigned long used_in = (fs.total_inodes >= fs.free_inodes)
@@ -155,10 +183,7 @@ static int get_fs_entry(const char *path, fs_entry_t *e)
 	e->total_inodes = fs.total_inodes;
 	e->used_inodes = used_in;
 	e->free_inodes = fs.free_inodes;
-	e->iuse_pct = (fs.total_inodes > 0)
-					  ? (unsigned) ((used_in * 100 + fs.total_inodes - 1) /
-									fs.total_inodes)
-					  : 0;
+	e->iuse_pct = calc_use_pct(used_in, fs.total_inodes);
 
 	/* Dual-perspective fields: rootresv_1k is reserved space for root,
 	 * and use_pct_real is usage including reserved blocks. */
@@ -169,11 +194,7 @@ static int get_fs_entry(const char *path, fs_entry_t *e)
 		uint64_t used_real = (fs.total_bytes >= fs.free_bytes_priv)
 								 ? fs.total_bytes - fs.free_bytes_priv
 								 : 0;
-		e->use_pct_real =
-			(fs.total_bytes > 0)
-				? (unsigned) ((used_real * 100 + fs.total_bytes - 1) /
-							  fs.total_bytes)
-				: 0;
+		e->use_pct_real = calc_use_pct(used_real, fs.total_bytes);
 	}
 
 	return 0;
@@ -190,50 +211,13 @@ static int uint64_width(uint64_t v)
 	return w;
 }
 
-/* Convert a KiB value to a human-readable string using K/M/G/T units.
+/* Base human-readable formatter supporting both capacities and raw counts.
  * Zero is printed as "0". */
-static char *fmt_human(uint64_t kb, char *buf, size_t buflen)
-{
-	static const char units[] = "KMGTPE";
-	double val;
-	int u;
-
-	if (kb == 0) {
-		snprintf(buf, buflen, "0");
-		return buf;
-	}
-	val = (double) kb;
-	u = 0;
-	while (val >= 1024.0 && u < (int) (sizeof(units) - 2)) {
-		val /= 1024.0;
-		u++;
-	}
-	if (val < 10.0) {
-			/* Apply ceiling rounding, matching the val >= 10 branch and GNU df -h behavior. */
-		int t = (int) (val * 10.0);
-		if ((double) t < val * 10.0)
-			t++;
-		if (t >= 100)
-			snprintf(buf, buflen, "%d%c", t / 10, units[u]);
-		else
-			snprintf(buf, buflen, "%d.%d%c", t / 10, t % 10, units[u]);
-	} else {
-			/* Apply ceiling rounding. */
-		uint64_t c = (uint64_t) val;
-		if ((double) c < val)
-			c++;
-		snprintf(buf, buflen, "%llu%c", (unsigned long long) c, units[u]);
-	}
-	return buf;
-}
-
-/* Convert a raw count, not a KiB value, to a human-readable string.
- * Zero is printed as "0". */
-static char *fmt_human_count(uint64_t n, char *buf, size_t buflen)
+static char *fmt_human_base(uint64_t n, int is_kib, char *buf, size_t buflen)
 {
 	static const char units[] = "KMGTPE";
 	double val = (double) n;
-	int u = -1;
+	int u = is_kib ? 0 : -1;
 
 	if (n == 0) {
 		snprintf(buf, buflen, "0");
@@ -246,7 +230,7 @@ static char *fmt_human_count(uint64_t n, char *buf, size_t buflen)
 	if (u < 0) {
 		snprintf(buf, buflen, "%llu", (unsigned long long) n);
 	} else if (val < 10.0) {
-			/* Apply ceiling rounding, matching the val >= 10 branch and GNU df -h behavior. */
+		/* Apply ceiling rounding, matching the val >= 10 branch and GNU df -h behavior. */
 		int t = (int) (val * 10.0);
 		if ((double) t < val * 10.0)
 			t++;
@@ -263,6 +247,18 @@ static char *fmt_human_count(uint64_t n, char *buf, size_t buflen)
 	return buf;
 }
 
+/* Formats capacity sizes (in 1K blocks) into human-readable strings */
+static char *fmt_human(uint64_t kb, char *buf, size_t buflen)
+{
+	return fmt_human_base(kb, 1, buf, buflen);
+}
+
+/* Formats raw counts (like inodes) into human-readable strings */
+static char *fmt_human_count(uint64_t n, char *buf, size_t buflen)
+{
+	return fmt_human_base(n, 0, buf, buflen);
+}
+
 /*
  * Scan once to compute maximum column widths, then print all rows.
  * Three output modes are supported:
@@ -271,19 +267,19 @@ static char *fmt_human_count(uint64_t n, char *buf, size_t buflen)
  *   both zero  -> default block view, matching df
  * All three modes can be combined with human=1 (-h).
  */
-static void
-print_entries(const fs_entry_t *e, int n, int human, int inode, int reserved)
+static void print_entries(const fs_entry_t *e, int n)
 {
 	int dev_w, col1_w, col2_w, col3_w, w, i;
+	const char *eol = DIAG_ANSI(!G.is_tui, DIAG_CLR_EOL);
 
 	/* Inode view (-i). */
-	if (inode) {
+	if (G.view_mode == FS_VIEW_INODE) {
 		dev_w = (int) strlen("Filesystem");
 		col1_w = (int) strlen("Inodes");
 		col2_w = (int) strlen("IUsed");
 		col3_w = (int) strlen("IFree");
 
-		if (human) {
+		if (G.human) {
 			char buf[16];
 			int dev_max = 0, c1_max = 0, c2_max = 0, c3_max = 0;
 
@@ -320,7 +316,7 @@ print_entries(const fs_entry_t *e, int n, int human, int inode, int reserved)
 						 ? c3_max + 1
 						 : (int) strlen("IFree");
 
-			printf("%-*s %*s %*s %*s %5s %s\n",
+			printf("%-*s %*s %*s %*s %5s %s%s\n",
 				   dev_w,
 				   "Filesystem",
 				   col1_w,
@@ -330,11 +326,12 @@ print_entries(const fs_entry_t *e, int n, int human, int inode, int reserved)
 				   col3_w,
 				   "IFree",
 				   "IUse%",
-				   "Mounted on");
+				   "Mounted on",
+				   eol);
 			for (i = 0; i < n; i++) {
 				char t[16], u_[16], f[16];
 				printf(
-					"%-*s %*s %*s %*s %4u%% %s\n",
+					"%-*s %*s %*s %*s %4u%% %s%s\n",
 					dev_w,
 					e[i].device,
 					col1_w,
@@ -345,7 +342,8 @@ print_entries(const fs_entry_t *e, int n, int human, int inode, int reserved)
 					col3_w,
 					fmt_human_count((uint64_t) e[i].free_inodes, f, sizeof(f)),
 					e[i].iuse_pct,
-					e[i].path);
+					e[i].path,
+					eol);
 			}
 		} else {
 			for (i = 0; i < n; i++) {
@@ -362,7 +360,7 @@ print_entries(const fs_entry_t *e, int n, int human, int inode, int reserved)
 				if (w > col3_w)
 					col3_w = w;
 			}
-			printf("%-*s %*s %*s %*s %5s %s\n",
+			printf("%-*s %*s %*s %*s %5s %s%s\n",
 				   dev_w,
 				   "Filesystem",
 				   col1_w,
@@ -372,9 +370,10 @@ print_entries(const fs_entry_t *e, int n, int human, int inode, int reserved)
 				   col3_w,
 				   "IFree",
 				   "IUse%",
-				   "Mounted on");
+				   "Mounted on",
+				   eol);
 			for (i = 0; i < n; i++) {
-				printf("%-*s %*lu %*lu %*lu %4u%% %s\n",
+				printf("%-*s %*lu %*lu %*lu %4u%% %s%s\n",
 					   dev_w,
 					   e[i].device,
 					   col1_w,
@@ -384,14 +383,15 @@ print_entries(const fs_entry_t *e, int n, int human, int inode, int reserved)
 					   col3_w,
 					   e[i].free_inodes,
 					   e[i].iuse_pct,
-					   e[i].path);
+					   e[i].path,
+					   eol);
 			}
 		}
 		return;
 	}
 
 	/* Dual-perspective view (-r). */
-	if (reserved) {
+	if (G.view_mode == FS_VIEW_RESERVED) {
 		int resv_w;
 
 		dev_w = (int) strlen("Filesystem");
@@ -400,7 +400,7 @@ print_entries(const fs_entry_t *e, int n, int human, int inode, int reserved)
 		col3_w = (int) strlen("Available");
 		resv_w = (int) strlen("RootResv");
 
-		if (human) {
+		if (G.human) {
 			char buf[16];
 			int dev_max = 0, c1_max = 0, c2_max = 0, c3_max = 0, rv_max = 0;
 
@@ -435,7 +435,7 @@ print_entries(const fs_entry_t *e, int n, int human, int inode, int reserved)
 						 ? rv_max + 1
 						 : (int) strlen("RootResv");
 
-			printf("%-*s %*s %*s %*s %4s %5s %*s %s\n",
+			printf("%-*s %*s %*s %*s %4s %5s %*s %s%s\n",
 				   dev_w,
 				   "Filesystem",
 				   col1_w,
@@ -448,10 +448,11 @@ print_entries(const fs_entry_t *e, int n, int human, int inode, int reserved)
 				   "RUse%",
 				   resv_w,
 				   "RootResv",
-				   "Mounted on");
+				   "Mounted on",
+				   eol);
 			for (i = 0; i < n; i++) {
 				char tbuf[16], ubuf[16], abuf[16], rbuf[16];
-				printf("%-*s %*s %*s %*s %3u%% %4u%% %*s %s\n",
+				printf("%-*s %*s %*s %*s %3u%% %4u%% %*s %s%s\n",
 					   dev_w,
 					   e[i].device,
 					   col1_w,
@@ -464,7 +465,8 @@ print_entries(const fs_entry_t *e, int n, int human, int inode, int reserved)
 					   e[i].use_pct_real,
 					   resv_w,
 					   fmt_human(e[i].rootresv_1k, rbuf, sizeof(rbuf)),
-					   e[i].path);
+					   e[i].path,
+					   eol);
 			}
 		} else {
 			for (i = 0; i < n; i++) {
@@ -484,7 +486,7 @@ print_entries(const fs_entry_t *e, int n, int human, int inode, int reserved)
 				if (w > resv_w)
 					resv_w = w;
 			}
-			printf("%-*s %*s %*s %*s %4s %5s %*s %s\n",
+			printf("%-*s %*s %*s %*s %4s %5s %*s %s%s\n",
 				   dev_w,
 				   "Filesystem",
 				   col1_w,
@@ -497,9 +499,10 @@ print_entries(const fs_entry_t *e, int n, int human, int inode, int reserved)
 				   "RUse%",
 				   resv_w,
 				   "RootResv",
-				   "Mounted on");
+				   "Mounted on",
+				   eol);
 			for (i = 0; i < n; i++) {
-				printf("%-*s %*llu %*llu %*llu %3u%% %4u%% %*llu %s\n",
+				printf("%-*s %*llu %*llu %*llu %3u%% %4u%% %*llu %s%s\n",
 					   dev_w,
 					   e[i].device,
 					   col1_w,
@@ -512,14 +515,15 @@ print_entries(const fs_entry_t *e, int n, int human, int inode, int reserved)
 					   e[i].use_pct_real,
 					   resv_w,
 					   (unsigned long long) e[i].rootresv_1k,
-					   e[i].path);
+					   e[i].path,
+					   eol);
 			}
 		}
 		return;
 	}
 
 	/* Default block view, matching df. */
-	if (human) {
+	if (G.human) {
 		char buf[16];
 		int dev_max = 0, total_max = 0, used_max = 0, avail_max = 0;
 
@@ -549,7 +553,7 @@ print_entries(const fs_entry_t *e, int n, int human, int inode, int reserved)
 					 ? avail_max + 1
 					 : (int) strlen("Avail");
 
-		printf("%-*s %*s %*s %*s %4s %s\n",
+		printf("%-*s %*s %*s %*s %4s %s%s\n",
 			   dev_w,
 			   "Filesystem",
 			   col1_w,
@@ -559,10 +563,11 @@ print_entries(const fs_entry_t *e, int n, int human, int inode, int reserved)
 			   col3_w,
 			   "Avail",
 			   "Use%",
-			   "Mounted on");
+			   "Mounted on",
+			   eol);
 		for (i = 0; i < n; i++) {
 			char tbuf[16], ubuf[16], abuf[16];
-			printf("%-*s %*s %*s %*s %3u%% %s\n",
+			printf("%-*s %*s %*s %*s %3u%% %s%s\n",
 				   dev_w,
 				   e[i].device,
 				   col1_w,
@@ -572,7 +577,8 @@ print_entries(const fs_entry_t *e, int n, int human, int inode, int reserved)
 				   col3_w,
 				   fmt_human(e[i].avail_1k, abuf, sizeof(abuf)),
 				   e[i].use_pct,
-				   e[i].path);
+				   e[i].path,
+				   eol);
 		}
 	} else {
 		dev_w = (int) strlen("Filesystem");
@@ -595,7 +601,7 @@ print_entries(const fs_entry_t *e, int n, int human, int inode, int reserved)
 				col3_w = w;
 		}
 
-		printf("%-*s %*s %*s %*s %4s %s\n",
+		printf("%-*s %*s %*s %*s %4s %s%s\n",
 			   dev_w,
 			   "Filesystem",
 			   col1_w,
@@ -605,9 +611,10 @@ print_entries(const fs_entry_t *e, int n, int human, int inode, int reserved)
 			   col3_w,
 			   "Available",
 			   "Use%",
-			   "Mounted on");
+			   "Mounted on",
+			   eol);
 		for (i = 0; i < n; i++) {
-			printf("%-*s %*llu %*llu %*llu %3u%% %s\n",
+			printf("%-*s %*llu %*llu %*llu %3u%% %s%s\n",
 				   dev_w,
 				   e[i].device,
 				   col1_w,
@@ -617,13 +624,15 @@ print_entries(const fs_entry_t *e, int n, int human, int inode, int reserved)
 				   col3_w,
 				   (unsigned long long) e[i].avail_1k,
 				   e[i].use_pct,
-				   e[i].path);
+				   e[i].path,
+				   eol);
 		}
 	}
 }
 
 /* L1: single-file fragmentation analysis for -f FILE. */
 
+/* Analyzes and prints extent fragmentation information for a single file */
 static int print_file_frag(const char *path)
 {
 	diag_frag_t f;
@@ -703,27 +712,10 @@ static int print_file_frag(const char *path)
 	return EXIT_SUCCESS;
 }
 
-/* L2: mounted-filesystem fragmentation statistics for -F PATH. */
-
-#define L2_TOP_N 10
-
-struct l2_top_entry {
-	char path[PATH_MAX];
-	uint32_t extents;
-	uint64_t size;
-};
-
-struct l2_ctx {
-	uint64_t total;
-	uint64_t frag;
-	uint64_t skipped; /* FTW_F entries where FIEMAP failed: permission denied or unsupported. */
-	uint64_t dist[4]; /* [0]=1, [1]=2-4, [2]=5-16, [3]=17+ extents */
-	struct l2_top_entry top[L2_TOP_N];
-	int top_count;
-};
-
-static struct l2_ctx g_l2;
-
+/*
+ * Callback function for nftw() during fragmentation scan (-F).
+ * Gathers extent statistics for regular files and updates distribution metrics.
+ */
 static int l2_nftw_cb(const char *path,
 					  const struct stat *sb,
 					  int typeflag,
@@ -741,54 +733,53 @@ static int l2_nftw_cb(const char *path,
 		/* Regular file, but FIEMAP failed because permission was denied or the
 		 * filesystem does not support it. Count it as skipped so total and the
 		 * fragmentation-rate denominator are not understated. */
-		g_l2.skipped++;
+		G.l2.skipped++;
 		return 0;
 	}
 
 	/* Skip empty files: 0 extents means no data is on disk, so there is no
-	 * fragmentation to report. Without this guard, empty files would land in
-	 * dist[0] (the "1 extent" bucket), inflating both total and dist[0]. */
+	 * fragmentation to report. Without this guard, empty files would incorrectly
+	 * inflate the total and fall into the wrong distribution bucket. */
 	if (f.extent_count == 0)
 		return 0;
 
-	g_l2.total++;
+	G.l2.total++;
 
 	if (f.extent_count == 1)
-		g_l2.dist[0]++;
+		G.l2.dist[0]++;
 	else if (f.extent_count <= 4)
-		g_l2.dist[1]++;
+		G.l2.dist[1]++;
 	else if (f.extent_count <= 16)
-		g_l2.dist[2]++;
+		G.l2.dist[2]++;
 	else
-		g_l2.dist[3]++;
+		G.l2.dist[3]++;
 
 	if (f.extent_count > 1)
-		g_l2.frag++;
+		G.l2.frag++;
 
-	if (g_l2.top_count < L2_TOP_N) {
-		safe_strncpy(g_l2.top[g_l2.top_count].path, path, PATH_MAX);
-		g_l2.top[g_l2.top_count].extents = f.extent_count;
-		g_l2.top[g_l2.top_count].size = f.file_size;
-		g_l2.top_count++;
+	if (G.l2.top_count < L2_TOP_N) {
+		safe_strncpy(G.l2.top[G.l2.top_count].path, path, PATH_MAX);
+		G.l2.top[G.l2.top_count].extents = f.extent_count;
+		G.l2.top_count++;
 	} else {
 		/* The top-file list is full; use the entry with the smallest extent_count
 		 * as the replacement candidate. This keeps the N files with the highest
 		 * extent counts. */
 		min_idx = 0;
 		for (i = 1; i < L2_TOP_N; i++) {
-			if (g_l2.top[i].extents < g_l2.top[min_idx].extents)
+			if (G.l2.top[i].extents < G.l2.top[min_idx].extents)
 				min_idx = i;
 		}
-		if (f.extent_count > g_l2.top[min_idx].extents) {
-			safe_strncpy(g_l2.top[min_idx].path, path, PATH_MAX);
-			g_l2.top[min_idx].extents = f.extent_count;
-			g_l2.top[min_idx].size = f.file_size;
+		if (f.extent_count > G.l2.top[min_idx].extents) {
+			safe_strncpy(G.l2.top[min_idx].path, path, PATH_MAX);
+			G.l2.top[min_idx].extents = f.extent_count;
 		}
 	}
 
 	return 0;
 }
 
+/* Comparison function to sort the top fragmented files by extent count */
 static int cmp_top_entry(const void *a, const void *b)
 {
 	const struct l2_top_entry *ea = (const struct l2_top_entry *) a;
@@ -798,12 +789,48 @@ static int cmp_top_entry(const void *a, const void *b)
 										 : 0;
 }
 
+/* Prints a summary of the filesystem fragmentation scan */
+static void print_frag_summary(struct l2_ctx *c, int batch_mode)
+{
+	int i;
+	double frag_pct =
+		(c->total > 0) ? (double) c->frag * 100.0 / (double) c->total : 0.0;
+	const char *eol = DIAG_ANSI(batch_mode, DIAG_CLR_EOL);
+
+	printf("Scanned: %llu files  Fragmented: %llu (%.1f%%)  Skipped: %llu%s\n",
+		   (unsigned long long) c->total,
+		   (unsigned long long) c->frag,
+		   frag_pct,
+		   (unsigned long long) c->skipped,
+		   eol);
+
+	if (batch_mode && c->skipped > 0)
+		printf("(skipped = no read permission or filesystem without FIEMAP;"
+			   " run as root for full coverage)\n");
+
+	printf("\nFragmentation distribution:%s\n", eol);
+	printf("  %-10s  %s%s\n", "Extents", "Files", eol);
+	printf("  %-10s  %llu%s\n", "1", (unsigned long long) c->dist[0], eol);
+	printf("  %-10s  %llu%s\n", "2-4", (unsigned long long) c->dist[1], eol);
+	printf("  %-10s  %llu%s\n", "5-16", (unsigned long long) c->dist[2], eol);
+	printf("  %-10s  %llu%s\n", "17+", (unsigned long long) c->dist[3], eol);
+
+	if (c->top_count > 0) {
+		qsort(c->top, c->top_count, sizeof(c->top[0]), cmp_top_entry);
+		printf("\nTop %d files by extent count:%s\n", c->top_count, eol);
+		printf("  %7s  %s%s\n", "Extents", "File", eol);
+		for (i = 0; i < c->top_count; i++)
+			printf("  %7u  %s%s\n", c->top[i].extents, c->top[i].path, eol);
+	}
+}
+
+/*
+ * Initiates a fragmentation scan on the given filesystem path (-F)
+ * and prints the statistics summary.
+ */
 static int print_frag_stat(const char *path)
 {
-	double frag_pct;
-	int i;
-
-	memset(&g_l2, 0, sizeof(g_l2));
+	memset(&G.l2, 0, sizeof(G.l2));
 	printf("Scanning %s ...\n\n", path);
 	/* nftw() returns -1 when even the root path cannot be walked, such as
 	 * when it does not exist or permission is denied.
@@ -812,62 +839,21 @@ static int print_frag_stat(const char *path)
 		bb_perror_msg("%s", path);
 		return EXIT_FAILURE;
 	}
-
-	frag_pct = (g_l2.total > 0)
-				   ? (double) g_l2.frag * 100.0 / (double) g_l2.total
-				   : 0.0;
-	printf("Scanned: %llu files  Fragmented: %llu (%.1f%%)  Skipped: %llu\n",
-		   (unsigned long long) g_l2.total,
-		   (unsigned long long) g_l2.frag,
-		   frag_pct,
-		   (unsigned long long) g_l2.skipped);
-	if (g_l2.skipped > 0)
-		printf("(skipped = no read permission or filesystem without FIEMAP;"
-			   " run as root for full coverage)\n");
-	printf("\n");
-
-	printf("Fragmentation distribution:\n");
-	printf("  %-10s  %s\n", "Extents", "Files");
-	printf("  %-10s  %llu\n", "1", (unsigned long long) g_l2.dist[0]);
-	printf("  %-10s  %llu\n", "2-4", (unsigned long long) g_l2.dist[1]);
-	printf("  %-10s  %llu\n", "5-16", (unsigned long long) g_l2.dist[2]);
-	printf("  %-10s  %llu\n", "17+", (unsigned long long) g_l2.dist[3]);
-
-	if (g_l2.top_count > 0) {
-		qsort(g_l2.top, g_l2.top_count, sizeof(g_l2.top[0]), cmp_top_entry);
-		printf("\nTop %d files by extent count:\n", g_l2.top_count);
-		printf("  %7s  %s\n", "Extents", "File");
-		for (i = 0; i < g_l2.top_count; i++)
-			printf("  %7u  %s\n", g_l2.top[i].extents, g_l2.top[i].path);
-	}
+	print_frag_summary(&G.l2, 1);
 	return EXIT_SUCCESS;
 }
 
 /* P5: interactive TUI mode (-s). */
 
-typedef enum {
-	FS_VIEW_DF,
-	FS_VIEW_INODE,
-	FS_VIEW_RESERVED,
-	FS_VIEW_FRAG,
-} fs_view_t;
-
-static fs_view_t g_tui_view = FS_VIEW_DF;
-static int g_tui_human = 0;
-static int g_tui_frag_ready = 0;
-static struct l2_ctx g_tui_frag_cache;
-
 /* Mount table cache: reuse the same list within the TTL to avoid reading
  * /proc/mounts every second. */
 #define MOUNT_CACHE_TTL 10
-static mount_node_t *g_tui_mount_cache = NULL;
-static time_t g_tui_mount_cache_ts = 0;
 
 static void tui_refresh_mount_cache(void)
 {
 	time_t now = time(NULL);
 	mount_node_t *fresh;
-	if (g_tui_mount_cache && (now - g_tui_mount_cache_ts) < MOUNT_CACHE_TTL)
+	if (G.mount_cache && (now - G.mount_cache_ts) < MOUNT_CACHE_TTL)
 		return;
 	/* Replace the old list only after a fresh list is read successfully.
 	 * On failure, keep the old cache and leave the timestamp unchanged so the
@@ -875,9 +861,9 @@ static void tui_refresh_mount_cache(void)
 	fresh = get_mount_list();
 	if (!fresh)
 		return;
-	free_mount_list(g_tui_mount_cache);
-	g_tui_mount_cache = fresh;
-	g_tui_mount_cache_ts = now;
+	free_mount_list(G.mount_cache);
+	G.mount_cache = fresh;
+	G.mount_cache_ts = now;
 }
 
 /* Scan mounts, deduplicate by st_dev, and return an fs_entry_t array.
@@ -953,39 +939,34 @@ static int collect_dedup_entries(mount_node_t *mounts,
 	for (i = 0; i < seen_n; i++) {
 		entries[n] = seen_entry[i]; /* Transfer string ownership. */
 		entries[n].device = xstrdup(seen_node[i]->device);
-		entries[n].fstype = xstrdup(seen_node[i]->fstype);
 		n++;
 	}
 	free(seen_dev);
 	free(seen_node);
-	free(seen_entry); /* Strings were moved into entries; free only the array. */
+	free(
+		seen_entry); /* Strings were moved into entries; free only the array. */
 	*out = entries;
 	return n;
 }
 
+/* Returns a displayable name for the current TUI view mode */
 static const char *tui_view_name(void)
 {
-	switch (g_tui_view) {
-	case FS_VIEW_DF:
-		return "Disk";
-	case FS_VIEW_INODE:
-		return "Inode";
-	case FS_VIEW_RESERVED:
-		return "Reserved";
-	case FS_VIEW_FRAG:
-		return "Fragment";
-	default:
-		return "?";
-	}
+	static const char *const view_names[] = {
+		"Disk", "Inode", "Reserved", "Fragment"};
+	if (G.view_mode >= FS_VIEW_DF && G.view_mode <= FS_VIEW_FRAG)
+		return view_names[G.view_mode];
+	return "?";
 }
 
+/* Prints the header panel for the interactive TUI mode */
 static void tui_print_header(void)
 {
-	printf(MYFS_CLR_SCREEN);
+	printf(DIAG_CLR_SCR);
 	printf(DIAG_CYAN "[MY_FS]" DIAG_RESET " View: " DIAG_YELLOW "%s" DIAG_RESET
 					 "  Human: %s" DIAG_CLR_EOL "\n",
 		   tui_view_name(),
-		   g_tui_human ? (DIAG_GREEN "on" DIAG_RESET) : "off");
+		   G.human ? (DIAG_GREEN "on" DIAG_RESET) : "off");
 	printf("D=disk  I=inode  R=reserved  F=frag(scan)  H=human  "
 		   "Q=quit" DIAG_CLR_EOL "\n");
 	printf("-----------------------------------------------------------"
@@ -995,217 +976,136 @@ static void tui_print_header(void)
 /* Run nftw() fragmentation statistics on / and store the result in cache. */
 static void tui_do_frag_scan(void)
 {
-	printf(MYFS_CLR_SCREEN);
+	printf(DIAG_CLR_SCR);
 	printf(
 		DIAG_YELLOW
 		"Scanning / for fragmentation, please wait..." DIAG_RESET DIAG_CLR_EOL
 		"\n");
 	fflush(stdout);
-	memset(&g_l2, 0, sizeof(g_l2));
+	memset(&G.l2, 0, sizeof(G.l2));
 	nftw("/", l2_nftw_cb, 16, FTW_MOUNT | FTW_PHYS);
-	g_tui_frag_cache = g_l2;
-	g_tui_frag_ready = 1;
+	G.frag_cache = G.l2;
+	G.frag_ready = true;
 }
 
+/* Prints the fragmentation view in the interactive TUI */
 static void tui_print_frag_view(void)
 {
-	int i;
-	double pct;
-	struct l2_ctx *c = &g_tui_frag_cache;
-
-	if (!g_tui_frag_ready) {
+	if (!G.frag_ready) {
 		printf("  (press F to start fragmentation scan on /)" DIAG_CLR_EOL
 			   "\n");
 		return;
 	}
-	pct = (c->total > 0) ? (double) c->frag * 100.0 / (double) c->total : 0.0;
 
 	printf("Scan path: /" DIAG_CLR_EOL "\n");
-	printf("Scanned: %llu files  Fragmented: %llu (%.1f%%)  Skipped: "
-		   "%llu" DIAG_CLR_EOL "\n\n",
-		   (unsigned long long) c->total,
-		   (unsigned long long) c->frag,
-		   pct,
-		   (unsigned long long) c->skipped);
-	printf("Fragmentation distribution:" DIAG_CLR_EOL "\n");
-	printf("  %-10s  %s" DIAG_CLR_EOL "\n", "Extents", "Files");
-	printf("  %-10s  %llu" DIAG_CLR_EOL "\n",
-		   "1",
-		   (unsigned long long) c->dist[0]);
-	printf("  %-10s  %llu" DIAG_CLR_EOL "\n",
-		   "2-4",
-		   (unsigned long long) c->dist[1]);
-	printf("  %-10s  %llu" DIAG_CLR_EOL "\n",
-		   "5-16",
-		   (unsigned long long) c->dist[2]);
-	printf("  %-10s  %llu" DIAG_CLR_EOL "\n",
-		   "17+",
-		   (unsigned long long) c->dist[3]);
-
-	if (c->top_count > 0) {
-		qsort(c->top, c->top_count, sizeof(c->top[0]), cmp_top_entry);
-		printf("\nTop %d files by extent count:" DIAG_CLR_EOL "\n",
-			   c->top_count);
-		printf("  %7s  %s" DIAG_CLR_EOL "\n", "Extents", "File");
-		for (i = 0; i < c->top_count; i++)
-			printf("  %7u  %s" DIAG_CLR_EOL "\n",
-				   c->top[i].extents,
-				   c->top[i].path);
-	}
+	print_frag_summary(&G.frag_cache, 0);
 	printf("\n  [cached - press F to re-scan]" DIAG_CLR_EOL "\n");
 }
 
-/* Read one key without blocking. Store the toupper-normalized key in *out.
- * Return 1 when a key is available, or 0 when there is no input. */
-static int tui_read_key(char *out)
-{
-	struct pollfd pfd = {STDIN_FILENO, POLLIN, 0};
-	char c;
-	if (safe_poll(&pfd, 1, 0) <= 0)
-		return 0;
-	if (safe_read(STDIN_FILENO, &c, 1) <= 0)
-		return 0;
-	if (c == 27) {
-		/* ESC: consume the rest of an escape sequence, such as ESC [ X from arrow
-		 * keys. Otherwise the 'D' in left-arrow ESC [ D would be treated as the
-		 * Disk-view hotkey. */
-		while (safe_poll(&pfd, 1, 0) > 0 && safe_read(STDIN_FILENO, &c, 1) == 1)
-			continue;
-		return 0;
-	}
-	*out = (char) toupper((unsigned char) c);
-	return 1;
-}
-
-/* TUI cleanup for abnormal exits.
- * Once raw mode is enabled, termios and the cursor must be restored on all
- * exit paths: normal Q exit, Ctrl-C/SIGTERM/SIGHUP, and BusyBox x* allocator
- * failures inside the loop. Otherwise the shell can remain in raw mode with
- * the cursor hidden, requiring manual stty sane or reset. */
-static struct termios g_tui_saved_termios;
-static volatile sig_atomic_t g_tui_active = 0;
-
-/* Restore termios and the cursor. This may run in a signal handler, so use
- * only async-signal-safe tcsetattr() and write(), and avoid stdio. */
-static void tui_restore(void)
-{
-	static const char show_cursor[] = DIAG_SHOW;
-	if (!g_tui_active)
-		return;
-	g_tui_active = 0;
-	tcsetattr(STDIN_FILENO, TCSANOW, &g_tui_saved_termios);
-	write(STDOUT_FILENO, show_cursor, sizeof(show_cursor) - 1);
-}
-
-/* atexit hook covering BusyBox x* allocator failures inside the loop. */
-static void tui_atexit(void)
-{
-	tui_restore();
-}
-
-/* Fatal signal handler: restore the terminal, reset the default disposition,
- * and re-raise the signal so the process exits with the correct 128+signo
- * status. */
-static void tui_sig_handler(int sig)
-{
-	tui_restore();
-	signal(sig, SIG_DFL);
-	raise(sig);
-}
-
+/* Main loop for the interactive TUI mode (-s) */
 static void show_fs_tui(void)
 {
-	struct pollfd pfd = {STDIN_FILENO, POLLIN, 0};
-
 	/* Require both stdin and stdout to be ttys. Input is read through
 	 * STDIN poll/read; if stdin is redirected, raw mode would be entered but no
 	 * key could be read, leaving Ctrl-C as the only escape. */
 	if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO))
 		bb_error_msg_and_die("-s requires a terminal");
 
-	diag_ui_mode_raw(&g_tui_saved_termios);
-	g_tui_active = 1;
-	atexit(tui_atexit);
-	bb_signals(BB_FATAL_SIGS, tui_sig_handler);
-	/* diag_ui_mode_raw() hides the cursor, so do not emit DIAG_HIDE here. */
+	diag_tui_init();
 
 	while (1) {
 		char c = 0;
-		tui_read_key(&c);
+		diag_ui_read_key(&c);
 
 		if (c == 'Q')
 			break;
 		else if (c == 'D')
-			g_tui_view = FS_VIEW_DF;
+			G.view_mode = FS_VIEW_DF;
 		else if (c == 'I')
-			g_tui_view = FS_VIEW_INODE;
+			G.view_mode = FS_VIEW_INODE;
 		else if (c == 'R')
-			g_tui_view = FS_VIEW_RESERVED;
+			G.view_mode = FS_VIEW_RESERVED;
 		else if (c == 'F') {
-			g_tui_view = FS_VIEW_FRAG;
+			G.view_mode = FS_VIEW_FRAG;
 			tui_do_frag_scan();
 		} else if (c == 'H')
-			g_tui_human = !g_tui_human;
+			G.human = !G.human;
 
 		tui_print_header();
-		if (g_tui_view == FS_VIEW_FRAG) {
+		if (G.view_mode == FS_VIEW_FRAG) {
 			tui_print_frag_view();
 		} else {
 			tui_refresh_mount_cache();
 			fs_entry_t *entries = NULL;
 			int i, n = collect_dedup_entries(
-					   g_tui_mount_cache, 0, NULL, 0, NULL, &entries);
-			print_entries(entries,
-						  n,
-						  g_tui_human,
-						  g_tui_view == FS_VIEW_INODE,
-						  g_tui_view == FS_VIEW_RESERVED);
+					   G.mount_cache, 0, NULL, 0, NULL, &entries);
+			print_entries(entries, n);
 			for (i = 0; i < n; i++)
 				free_fs_entry(&entries[i]);
 			free(entries);
 		}
+		printf(DIAG_CLR_DOWN);
 		fflush(stdout);
 
-		safe_poll(&pfd, 1, 1000);
+		diag_delay(1000, 0);
 	}
 
-	free_mount_list(g_tui_mount_cache);
-	g_tui_mount_cache = NULL;
+	free_mount_list(G.mount_cache);
+	G.mount_cache = NULL;
 
-	g_tui_active = 0;
-	/* diag_ui_mode_normal() restores the cursor, so do not emit DIAG_SHOW here. */
-	diag_ui_mode_normal(&g_tui_saved_termios);
+	diag_tui_restore();
 	printf("\n");
 	fflush(stdout);
 }
 
+/* Command line options flags */
+enum {
+	OPT_h = (1 << 0),
+	OPT_i = (1 << 1),
+	OPT_r = (1 << 2),
+	OPT_t = (1 << 3),
+	OPT_x = (1 << 4),
+	OPT_f = (1 << 5),
+	OPT_F = (1 << 6),
+	OPT_s = (1 << 7),
+};
+
+/*
+ * Main entry point for the my_fs applet.
+ * Parses command-line arguments and routes to the appropriate functionality.
+ */
 int my_fs_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
 int my_fs_main(int argc, char **argv)
 {
 	char *opt_t = NULL, *opt_x = NULL, *opt_f = NULL, *opt_F = NULL;
 	unsigned opts =
 		getopt32(argv, "hirt:x:f:F:s", &opt_t, &opt_x, &opt_f, &opt_F);
-	int human = (opts & (1 << 0));
-	int inode = (opts & (1 << 1));
-	int reserved = (opts & (1 << 2));
-	int has_t = (opts & (1 << 3));
-	int has_x = (opts & (1 << 4));
-	int has_f = (opts & (1 << 5));
-	int has_F = (opts & (1 << 6));
-	int has_s = (opts & (1 << 7));
+	int has_t = (opts & OPT_t);
+	int has_x = (opts & OPT_x);
+	int has_f = (opts & OPT_f);
+	int has_F = (opts & OPT_F);
 	argv += optind;
+
+	G.human = (opts & OPT_h);
+	if (opts & OPT_i)
+		G.view_mode = FS_VIEW_INODE;
+	else if (opts & OPT_r)
+		G.view_mode = FS_VIEW_RESERVED;
+	else
+		G.view_mode = FS_VIEW_DF;
+
+	G.is_tui = (opts & OPT_s);
 
 	/* -f, -F, and -s are mutually exclusive action modes. Combining them is
 	 * ambiguous, so report a usage error instead of silently choosing one. */
-	if (!!has_f + !!has_F + !!has_s > 1)
+	if (!!has_f + !!has_F + !!G.is_tui > 1)
 		bb_show_usage();
 
 	if (has_f)
 		return print_file_frag(opt_f);
 	if (has_F)
 		return print_frag_stat(opt_F);
-	if (has_s) {
-		g_tui_human = human;
+	if (G.is_tui) {
 		show_fs_tui();
 		return EXIT_SUCCESS;
 	}
@@ -1216,7 +1116,7 @@ int my_fs_main(int argc, char **argv)
 	int had_error = 0;
 
 	if (!argv[0]) {
-			/* No-argument mode must be able to enumerate the mount table.
+		/* No-argument mode must be able to enumerate the mount table.
 			 * NULL means either setmntent() failed or the mount table is empty;
 			 * both are abnormal on Linux because /proc/mounts should always have
 			 * entries. Report the error explicitly instead of printing an empty
@@ -1227,7 +1127,7 @@ int my_fs_main(int argc, char **argv)
 		}
 		n = collect_dedup_entries(mounts, has_t, opt_t, has_x, opt_x, &entries);
 	} else {
-			/* Arguments were provided: collect one fs_entry_t for each path. */
+		/* Arguments were provided: collect one fs_entry_t for each path. */
 		char **arg;
 		int argc_n = 0;
 		for (arg = argv; *arg; arg++)
@@ -1245,7 +1145,7 @@ int my_fs_main(int argc, char **argv)
 				had_error = 1;
 				continue;
 			}
-				/* Match df behavior: first canonicalize the path with realpath,
+			/* Match df behavior: first canonicalize the path with realpath,
 				 * resolving relative paths, symlinks, and "..", then choose the
 				 * longest mountpoint prefix with boundary checks.
 				 * The boundary check prevents /foo from matching /foobar. The
@@ -1271,11 +1171,12 @@ int my_fs_main(int argc, char **argv)
 			if (best) {
 				if ((has_t && strcmp(best->fstype, opt_t) != 0) ||
 					(has_x && strcmp(best->fstype, opt_x) == 0)) {
-					free_fs_entry(&entries[n]); /* Free the already allocated path when filtered out. */
+					free_fs_entry(
+						&entries
+							[n]); /* Free the already allocated path when filtered out. */
 					continue;
 				}
 				entries[n].device = xstrdup(best->device);
-				entries[n].fstype = xstrdup(best->fstype);
 				/* Match df's "Mounted on" column: show the actual mountpoint instead of
 				 * the user-provided path. */
 				free(entries[n].path);
@@ -1287,7 +1188,7 @@ int my_fs_main(int argc, char **argv)
 		}
 	}
 
-	print_entries(entries, n, human, inode, reserved);
+	print_entries(entries, n);
 	for (i = 0; i < n; i++)
 		free_fs_entry(&entries[i]);
 	free(entries);
