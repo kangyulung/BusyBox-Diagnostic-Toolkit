@@ -27,16 +27,27 @@
 
 #include "libdiag.h"
 
+/*
+ * Represents a single process node in the system.
+ * Extends the basic diag_node_base_t for tree construction.
+ */
 typedef struct proc_node {
 	diag_node_base_t base;
 	procps_status_t *pinfo;
-	unsigned cpu_pcnt_10;
-	unsigned mem_pcnt_10;
+	unsigned
+		cpu_pcnt_10; /* CPU usage percentage * 10 (for fixed-point formatting) */
+	unsigned
+		mem_pcnt_10; /* Memory usage percentage * 10 (for fixed-point formatting) */
 	char time_str[16];
 } proc_node_t;
 
+/* View mode for the process list */
 typedef enum { VIEW_TOP, VIEW_TREE } view_mode_t;
 
+/*
+ * Context structure storing the global state and configuration
+ * for the process viewer.
+ */
 typedef struct {
 	view_mode_t view_mode;
 	char sort_mode;
@@ -47,8 +58,10 @@ typedef struct {
 	int width, height;
 } proc_ctx_t;
 
+/* Global context initialized with default values */
 static proc_ctx_t G = {VIEW_TOP, 'P', -1, 1.0, -1, false, 80, 24};
 
+/* Updates the terminal width and height in the global context */
 static void update_term_size(void)
 {
 	if (G.batch_mode) {
@@ -59,6 +72,7 @@ static void update_term_size(void)
 	get_terminal_width_height(STDOUT_FILENO, &G.width, &G.height);
 }
 
+/* Returns a human-readable label for the current sort mode */
 static const char *get_sort_label(void)
 {
 	switch (G.sort_mode) {
@@ -83,6 +97,10 @@ static const char *get_sort_label(void)
 	}
 }
 
+/*
+ * Comparison function used for qsort.
+ * Sorts process nodes based on the currently selected sort mode in G.sort_mode.
+ */
 static int sort_func(const void *a, const void *b)
 {
 	proc_node_t *na = *(proc_node_t **) a;
@@ -119,6 +137,10 @@ static int sort_func(const void *a, const void *b)
 	return res ? res : DIAG_CMP(pa->pid, pb->pid);
 }
 
+/*
+ * Recursively prints the process tree with visual tree lines.
+ * Uses a bitmask to keep track of vertical lines needed at each indentation level.
+ */
 static void print_tree_rich(proc_node_t *curr, int indent, uint64_t mask)
 {
 	while (curr) {
@@ -134,8 +156,10 @@ static void print_tree_rich(proc_node_t *curr, int indent, uint64_t mask)
 			   curr->pinfo->comm,
 			   curr->pinfo->state[0],
 			   make_human_readable_str(curr->pinfo->rss * 1024ULL, 1, 0),
-			   curr->cpu_pcnt_10 / 10, curr->cpu_pcnt_10 % 10,
-			   curr->mem_pcnt_10 / 10, curr->mem_pcnt_10 % 10,
+			   curr->cpu_pcnt_10 / 10,
+			   curr->cpu_pcnt_10 % 10,
+			   curr->mem_pcnt_10 / 10,
+			   curr->mem_pcnt_10 % 10,
 			   curr->time_str,
 			   DIAG_ANSI(G.batch_mode, DIAG_CLR_EOL));
 
@@ -153,6 +177,10 @@ static void print_tree_rich(proc_node_t *curr, int indent, uint64_t mask)
 	}
 }
 
+/*
+ * Scans the procfs to build a linked list of all current processes.
+ * Optionally filters by a target PID if specified in the global context.
+ */
 static proc_node_t *fetch_proc_list(void)
 {
 	proc_node_t *list = NULL;
@@ -166,7 +194,7 @@ static proc_node_t *fetch_proc_list(void)
 			continue;
 
 		proc_node_t *n = xzalloc(sizeof(*n) + sizeof(*p));
-		n->pinfo = (procps_status_t *)(n + 1);
+		n->pinfo = (procps_status_t *) (n + 1);
 		memcpy(n->pinfo, p, sizeof(*p));
 		n->base.id = p->pid;
 		n->base.parent_id = p->ppid;
@@ -176,13 +204,19 @@ static proc_node_t *fetch_proc_list(void)
 	return list;
 }
 
+/*
+ * Prints the top header including system memory and load averages.
+ * Skipped in batch mode.
+ */
 static void print_header(diag_sys_snap_t *snap)
 {
 	if (G.batch_mode)
 		return;
 
 	printf(DIAG_CLR_SCR);
-	printf(DIAG_CYAN "[MY_PROC]" DIAG_RESET " Mode: " DIAG_YELLOW "%s" DIAG_RESET " | Sort: " DIAG_GREEN "%s" DIAG_RESET " | Width: %d" DIAG_CLR_EOL "\n",
+	printf(DIAG_CYAN "[MY_PROC]" DIAG_RESET " Mode: " DIAG_YELLOW
+					 "%s" DIAG_RESET " | Sort: " DIAG_GREEN "%s" DIAG_RESET
+					 " | Width: %d" DIAG_CLR_EOL "\n",
 		   G.view_mode == VIEW_TREE ? "TREE" : "LIST",
 		   get_sort_label(),
 		   G.width);
@@ -195,6 +229,10 @@ static void print_header(diag_sys_snap_t *snap)
 		   snap->load_avg[2]);
 }
 
+/*
+ * Handles user input in interactive mode.
+ * Returns false if the user requests to quit (e.g., presses 'Q'), true otherwise.
+ */
 static bool handle_input(void)
 {
 	char c;
@@ -204,9 +242,9 @@ static bool handle_input(void)
 	while (1) {
 		int res = diag_ui_read_key(&c);
 		if (res < 0)
-			return false; /* 發生 EOF */
+			return false; /* EOF occurred */
 		if (res == 0)
-			break; /* 無輸入 */
+			break; /* No input */
 
 		if (c == 'Q')
 			return false;
@@ -229,6 +267,10 @@ static bool handle_input(void)
 	return true;
 }
 
+/*
+ * Calculates CPU and memory usage percentages for each process,
+ * and formats the total CPU time into a string.
+ */
 static void prepare_display_data(proc_node_t *head,
 								 proc_node_t **prev_arr,
 								 int prev_cnt,
@@ -238,21 +280,25 @@ static void prepare_display_data(proc_node_t *head,
 	for (proc_node_t *n = head; n; n = (proc_node_t *) n->base.next) {
 		n->cpu_pcnt_10 = 0;
 		if (prev_arr && diff > 0) {
-			proc_node_t *p = (proc_node_t *)
-				diag_find_node((diag_node_base_t **)prev_arr, prev_cnt, n->base.id);
+			proc_node_t *p = (proc_node_t *) diag_find_node(
+				(diag_node_base_t **) prev_arr, prev_cnt, n->base.id);
 			if (p) {
-				long ticks = (long)((n->pinfo->utime + n->pinfo->stime) -
-									(p->pinfo->utime + p->pinfo->stime));
+				long ticks = (long) ((n->pinfo->utime + n->pinfo->stime) -
+									 (p->pinfo->utime + p->pinfo->stime));
 				if (ticks > 0)
 					n->cpu_pcnt_10 = (unsigned) ((ticks * 1000ULL) / diff);
 			}
 		}
 		n->mem_pcnt_10 =
-			(total_mem > 0) ? (unsigned) ((n->pinfo->rss * 1000ULL) / total_mem) : 0;
+			(total_mem > 0) ? (unsigned) ((n->pinfo->rss * 1000ULL) / total_mem)
+							: 0;
 		diag_format_time(n->time_str, n->pinfo->utime, n->pinfo->stime);
 	}
 }
 
+/*
+ * Displays the list of processes in a hierarchical tree view.
+ */
 static void display_tree(proc_node_t **sorted_arr, int cnt)
 {
 
@@ -274,6 +320,9 @@ static void display_tree(proc_node_t **sorted_arr, int cnt)
 	print_tree_rich((proc_node_t *) root_list, 0, 0);
 }
 
+/*
+ * Displays the list of processes in a flat, sorted table view.
+ */
 static void display_list(proc_node_t **sorted_arr, int cnt)
 {
 
@@ -285,8 +334,17 @@ static void display_list(proc_node_t **sorted_arr, int cnt)
 		comm_width = 10;
 	if (G.batch_mode) {
 		printf("%-6s %-6s %-6s %-10s %-4s %-4s %8s %8s %6s %6s %8s COMMAND\n",
-			   "PID", "PPID", "SID", "USER", "STAT", "NI", "VSZ", "RSS",
-			   "%CPU", "%MEM", "TIME");
+			   "PID",
+			   "PPID",
+			   "SID",
+			   "USER",
+			   "STAT",
+			   "NI",
+			   "VSZ",
+			   "RSS",
+			   "%CPU",
+			   "%MEM",
+			   "TIME");
 	} else {
 		printf("%-6s %-6s %-6s %-10s %-4s %-4s %8s %8s %6s %6s %8s "
 			   "%.*s" DIAG_CLR_EOL "\n",
@@ -321,8 +379,10 @@ static void display_list(proc_node_t **sorted_arr, int cnt)
 			   cn->pinfo->niceness,
 			   make_human_readable_str(cn->pinfo->vsz * 1024ULL, 1, 0),
 			   make_human_readable_str(cn->pinfo->rss * 1024ULL, 1, 0),
-			   cn->cpu_pcnt_10 / 10, cn->cpu_pcnt_10 % 10,
-			   cn->mem_pcnt_10 / 10, cn->mem_pcnt_10 % 10,
+			   cn->cpu_pcnt_10 / 10,
+			   cn->cpu_pcnt_10 % 10,
+			   cn->mem_pcnt_10 / 10,
+			   cn->mem_pcnt_10 % 10,
 			   cn->time_str,
 			   G.batch_mode ? 256 : comm_width,
 			   cn->pinfo->comm,
@@ -330,6 +390,10 @@ static void display_list(proc_node_t **sorted_arr, int cnt)
 	}
 }
 
+/*
+ * Main loop for the top-like process viewer.
+ * Periodically fetches process data, computes usage, and updates the display.
+ */
 static void show_top_with_cpu(void)
 {
 
@@ -358,7 +422,10 @@ static void show_top_with_cpu(void)
 			(diag_node_base_t *) curr_list, &curr_cnt);
 
 		if (prev_sort_arr && diff > 0) {
-			qsort(prev_sort_arr, prev_cnt, sizeof(diag_node_base_t *), diag_node_cmp);
+			qsort(prev_sort_arr,
+				  prev_cnt,
+				  sizeof(diag_node_base_t *),
+				  diag_node_cmp);
 		}
 
 		if (!handle_input()) {
@@ -378,10 +445,11 @@ static void show_top_with_cpu(void)
 		}
 
 		if (!G.batch_mode) {
-			printf(DIAG_CLR_DOWN "\n" DIAG_INVERT
+			printf(DIAG_CLR_DOWN
+				   "\n" DIAG_INVERT
 				   " SORT: (P)CPU (M)RSS (V)VSZ (I)PID (O)PPID "
 				   "(U)USER (S)SID (C)CMD | (T)TREE (K)KILL (Q)QUIT " DIAG_RESET
-				   DIAG_CLR_EOL);
+					   DIAG_CLR_EOL);
 			fflush(stdout);
 		}
 
@@ -400,7 +468,7 @@ static void show_top_with_cpu(void)
 		if (G.iterations == 0)
 			break;
 
-		diag_delay((int)(G.delay * 1000), G.batch_mode);
+		diag_delay((int) (G.delay * 1000), G.batch_mode);
 	}
 
 	if (prev_list)
@@ -415,6 +483,7 @@ static void show_top_with_cpu(void)
 	}
 }
 
+/* Command line options flags */
 enum {
 	OPT_t = (1 << 0),
 	OPT_d = (1 << 1),
@@ -423,6 +492,10 @@ enum {
 	OPT_b = (1 << 4),
 };
 
+/*
+ * Main entry point for the my_proc applet.
+ * Parses command-line arguments and starts the process viewer.
+ */
 int my_proc_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
 int my_proc_main(int argc, char **argv)
 {

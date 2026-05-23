@@ -214,7 +214,7 @@ if ! has_cmd ss; then
     for t in T16 T17 T18; do skip "$t (ss not found)"; done
 else
     # T16: ESTABLISHED count within ±5 of ss -tn
-    # FIX: 移除 || echo 0，避免 grep -c 回傳 "0\n0" 造成 $(( )) syntax error
+    # FIX: Remove '|| echo 0' to prevent grep -c from returning "0\n0", which causes a syntax error in $(( ))
     ss_est=$(ss -tn 2>/dev/null | grep -c 'ESTAB')
     my_est=$($BUSYBOX my_net -b -s ESTABLISHED 2>/dev/null | count_rows)
     diff_est=$(( ${ss_est:-0} > ${my_est:-0} \
@@ -239,7 +239,7 @@ else
     fi
 
     # T18: UDP count within ±5 of ss -un
-    # FIX: 用 awk 統計非空行，完全避免 grep -c 的 exit-code 問題
+    # FIX: Use awk to count non-empty lines, completely avoiding grep -c exit-code issues
     ss_udp=$(ss -un 2>/dev/null | awk 'NR>1 && NF>0 {c++} END {print c+0}')
     my_udp=$($BUSYBOX my_net -u -b 2>/dev/null | count_rows)
     diff_udp=$(( ${ss_udp:-0} > ${my_udp:-0} \

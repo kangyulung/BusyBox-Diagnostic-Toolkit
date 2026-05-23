@@ -28,7 +28,6 @@
 #include <ftw.h>
 #include <mntent.h>
 
-
 /* Mount list node parsed from the mount table.
  * The three strings are allocated with xstrdup() and freed by
  * free_mount_list().
@@ -58,8 +57,9 @@ typedef struct {
 	unsigned long free_inodes;
 	unsigned iuse_pct; /* Ceiling-rounded. */
 	/* Dual-perspective fields, used by -r. */
-	uint64_t rootresv_1k;  /* (f_bfree - f_bavail) * f_frsize / 1024 */
-	unsigned use_pct_real; /* ceiling(used_real / total * 100), including reserved blocks */
+	uint64_t rootresv_1k; /* (f_bfree - f_bavail) * f_frsize / 1024 */
+	unsigned
+		use_pct_real; /* ceiling(used_real / total * 100), including reserved blocks */
 } fs_entry_t;
 
 /* L2: mounted-filesystem fragmentation statistics for -F PATH. */
@@ -99,6 +99,7 @@ typedef struct {
 
 static fs_ctx_t G;
 
+/* Frees the dynamically allocated strings inside an fs_entry_t */
 static void free_fs_entry(fs_entry_t *e)
 {
 	if (!e)
@@ -229,7 +230,7 @@ static char *fmt_human_base(uint64_t n, int is_kib, char *buf, size_t buflen)
 	if (u < 0) {
 		snprintf(buf, buflen, "%llu", (unsigned long long) n);
 	} else if (val < 10.0) {
-			/* Apply ceiling rounding, matching the val >= 10 branch and GNU df -h behavior. */
+		/* Apply ceiling rounding, matching the val >= 10 branch and GNU df -h behavior. */
 		int t = (int) (val * 10.0);
 		if ((double) t < val * 10.0)
 			t++;
@@ -246,11 +247,13 @@ static char *fmt_human_base(uint64_t n, int is_kib, char *buf, size_t buflen)
 	return buf;
 }
 
+/* Formats capacity sizes (in 1K blocks) into human-readable strings */
 static char *fmt_human(uint64_t kb, char *buf, size_t buflen)
 {
 	return fmt_human_base(kb, 1, buf, buflen);
 }
 
+/* Formats raw counts (like inodes) into human-readable strings */
 static char *fmt_human_count(uint64_t n, char *buf, size_t buflen)
 {
 	return fmt_human_base(n, 0, buf, buflen);
@@ -323,10 +326,12 @@ static void print_entries(const fs_entry_t *e, int n)
 				   col3_w,
 				   "IFree",
 				   "IUse%",
-				   "Mounted on", eol);
+				   "Mounted on",
+				   eol);
 			for (i = 0; i < n; i++) {
 				char t[16], u_[16], f[16];
-				printf("%-*s %*s %*s %*s %4u%% %s%s\n",
+				printf(
+					"%-*s %*s %*s %*s %4u%% %s%s\n",
 					dev_w,
 					e[i].device,
 					col1_w,
@@ -337,7 +342,8 @@ static void print_entries(const fs_entry_t *e, int n)
 					col3_w,
 					fmt_human_count((uint64_t) e[i].free_inodes, f, sizeof(f)),
 					e[i].iuse_pct,
-					e[i].path, eol);
+					e[i].path,
+					eol);
 			}
 		} else {
 			for (i = 0; i < n; i++) {
@@ -364,7 +370,8 @@ static void print_entries(const fs_entry_t *e, int n)
 				   col3_w,
 				   "IFree",
 				   "IUse%",
-				   "Mounted on", eol);
+				   "Mounted on",
+				   eol);
 			for (i = 0; i < n; i++) {
 				printf("%-*s %*lu %*lu %*lu %4u%% %s%s\n",
 					   dev_w,
@@ -376,7 +383,8 @@ static void print_entries(const fs_entry_t *e, int n)
 					   col3_w,
 					   e[i].free_inodes,
 					   e[i].iuse_pct,
-					   e[i].path, eol);
+					   e[i].path,
+					   eol);
 			}
 		}
 		return;
@@ -440,7 +448,8 @@ static void print_entries(const fs_entry_t *e, int n)
 				   "RUse%",
 				   resv_w,
 				   "RootResv",
-				   "Mounted on", eol);
+				   "Mounted on",
+				   eol);
 			for (i = 0; i < n; i++) {
 				char tbuf[16], ubuf[16], abuf[16], rbuf[16];
 				printf("%-*s %*s %*s %*s %3u%% %4u%% %*s %s%s\n",
@@ -456,7 +465,8 @@ static void print_entries(const fs_entry_t *e, int n)
 					   e[i].use_pct_real,
 					   resv_w,
 					   fmt_human(e[i].rootresv_1k, rbuf, sizeof(rbuf)),
-					   e[i].path, eol);
+					   e[i].path,
+					   eol);
 			}
 		} else {
 			for (i = 0; i < n; i++) {
@@ -489,7 +499,8 @@ static void print_entries(const fs_entry_t *e, int n)
 				   "RUse%",
 				   resv_w,
 				   "RootResv",
-				   "Mounted on", eol);
+				   "Mounted on",
+				   eol);
 			for (i = 0; i < n; i++) {
 				printf("%-*s %*llu %*llu %*llu %3u%% %4u%% %*llu %s%s\n",
 					   dev_w,
@@ -504,7 +515,8 @@ static void print_entries(const fs_entry_t *e, int n)
 					   e[i].use_pct_real,
 					   resv_w,
 					   (unsigned long long) e[i].rootresv_1k,
-					   e[i].path, eol);
+					   e[i].path,
+					   eol);
 			}
 		}
 		return;
@@ -551,7 +563,8 @@ static void print_entries(const fs_entry_t *e, int n)
 			   col3_w,
 			   "Avail",
 			   "Use%",
-			   "Mounted on", eol);
+			   "Mounted on",
+			   eol);
 		for (i = 0; i < n; i++) {
 			char tbuf[16], ubuf[16], abuf[16];
 			printf("%-*s %*s %*s %*s %3u%% %s%s\n",
@@ -564,7 +577,8 @@ static void print_entries(const fs_entry_t *e, int n)
 				   col3_w,
 				   fmt_human(e[i].avail_1k, abuf, sizeof(abuf)),
 				   e[i].use_pct,
-				   e[i].path, eol);
+				   e[i].path,
+				   eol);
 		}
 	} else {
 		dev_w = (int) strlen("Filesystem");
@@ -597,7 +611,8 @@ static void print_entries(const fs_entry_t *e, int n)
 			   col3_w,
 			   "Available",
 			   "Use%",
-			   "Mounted on", eol);
+			   "Mounted on",
+			   eol);
 		for (i = 0; i < n; i++) {
 			printf("%-*s %*llu %*llu %*llu %3u%% %s%s\n",
 				   dev_w,
@@ -609,13 +624,15 @@ static void print_entries(const fs_entry_t *e, int n)
 				   col3_w,
 				   (unsigned long long) e[i].avail_1k,
 				   e[i].use_pct,
-				   e[i].path, eol);
+				   e[i].path,
+				   eol);
 		}
 	}
 }
 
 /* L1: single-file fragmentation analysis for -f FILE. */
 
+/* Analyzes and prints extent fragmentation information for a single file */
 static int print_file_frag(const char *path)
 {
 	diag_frag_t f;
@@ -695,6 +712,10 @@ static int print_file_frag(const char *path)
 	return EXIT_SUCCESS;
 }
 
+/*
+ * Callback function for nftw() during fragmentation scan (-F).
+ * Gathers extent statistics for regular files and updates distribution metrics.
+ */
 static int l2_nftw_cb(const char *path,
 					  const struct stat *sb,
 					  int typeflag,
@@ -717,8 +738,8 @@ static int l2_nftw_cb(const char *path,
 	}
 
 	/* Skip empty files: 0 extents means no data is on disk, so there is no
-	 * fragmentation to report. Without this guard, empty files would land in
-	 * dist[0] (the "1 extent" bucket), inflating both total and dist[0]. */
+	 * fragmentation to report. Without this guard, empty files would incorrectly
+	 * inflate the total and fall into the wrong distribution bucket. */
 	if (f.extent_count == 0)
 		return 0;
 
@@ -758,6 +779,7 @@ static int l2_nftw_cb(const char *path,
 	return 0;
 }
 
+/* Comparison function to sort the top fragmented files by extent count */
 static int cmp_top_entry(const void *a, const void *b)
 {
 	const struct l2_top_entry *ea = (const struct l2_top_entry *) a;
@@ -767,19 +789,20 @@ static int cmp_top_entry(const void *a, const void *b)
 										 : 0;
 }
 
+/* Prints a summary of the filesystem fragmentation scan */
 static void print_frag_summary(struct l2_ctx *c, int batch_mode)
 {
 	int i;
-	double frag_pct = (c->total > 0)
-				   ? (double) c->frag * 100.0 / (double) c->total
-				   : 0.0;
+	double frag_pct =
+		(c->total > 0) ? (double) c->frag * 100.0 / (double) c->total : 0.0;
 	const char *eol = DIAG_ANSI(batch_mode, DIAG_CLR_EOL);
 
 	printf("Scanned: %llu files  Fragmented: %llu (%.1f%%)  Skipped: %llu%s\n",
 		   (unsigned long long) c->total,
 		   (unsigned long long) c->frag,
 		   frag_pct,
-		   (unsigned long long) c->skipped, eol);
+		   (unsigned long long) c->skipped,
+		   eol);
 
 	if (batch_mode && c->skipped > 0)
 		printf("(skipped = no read permission or filesystem without FIEMAP;"
@@ -801,6 +824,10 @@ static void print_frag_summary(struct l2_ctx *c, int batch_mode)
 	}
 }
 
+/*
+ * Initiates a fragmentation scan on the given filesystem path (-F)
+ * and prints the statistics summary.
+ */
 static int print_frag_stat(const char *path)
 {
 	memset(&G.l2, 0, sizeof(G.l2));
@@ -916,21 +943,23 @@ static int collect_dedup_entries(mount_node_t *mounts,
 	}
 	free(seen_dev);
 	free(seen_node);
-	free(seen_entry); /* Strings were moved into entries; free only the array. */
+	free(
+		seen_entry); /* Strings were moved into entries; free only the array. */
 	*out = entries;
 	return n;
 }
 
+/* Returns a displayable name for the current TUI view mode */
 static const char *tui_view_name(void)
 {
 	static const char *const view_names[] = {
-		"Disk", "Inode", "Reserved", "Fragment"
-	};
+		"Disk", "Inode", "Reserved", "Fragment"};
 	if (G.view_mode >= FS_VIEW_DF && G.view_mode <= FS_VIEW_FRAG)
 		return view_names[G.view_mode];
 	return "?";
 }
 
+/* Prints the header panel for the interactive TUI mode */
 static void tui_print_header(void)
 {
 	printf(DIAG_CLR_SCR);
@@ -959,6 +988,7 @@ static void tui_do_frag_scan(void)
 	G.frag_ready = true;
 }
 
+/* Prints the fragmentation view in the interactive TUI */
 static void tui_print_frag_view(void)
 {
 	if (!G.frag_ready) {
@@ -972,6 +1002,7 @@ static void tui_print_frag_view(void)
 	printf("\n  [cached - press F to re-scan]" DIAG_CLR_EOL "\n");
 }
 
+/* Main loop for the interactive TUI mode (-s) */
 static void show_fs_tui(void)
 {
 	/* Require both stdin and stdout to be ttys. Input is read through
@@ -1027,6 +1058,7 @@ static void show_fs_tui(void)
 	fflush(stdout);
 }
 
+/* Command line options flags */
 enum {
 	OPT_h = (1 << 0),
 	OPT_i = (1 << 1),
@@ -1038,6 +1070,10 @@ enum {
 	OPT_s = (1 << 7),
 };
 
+/*
+ * Main entry point for the my_fs applet.
+ * Parses command-line arguments and routes to the appropriate functionality.
+ */
 int my_fs_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
 int my_fs_main(int argc, char **argv)
 {
@@ -1080,7 +1116,7 @@ int my_fs_main(int argc, char **argv)
 	int had_error = 0;
 
 	if (!argv[0]) {
-			/* No-argument mode must be able to enumerate the mount table.
+		/* No-argument mode must be able to enumerate the mount table.
 			 * NULL means either setmntent() failed or the mount table is empty;
 			 * both are abnormal on Linux because /proc/mounts should always have
 			 * entries. Report the error explicitly instead of printing an empty
@@ -1091,7 +1127,7 @@ int my_fs_main(int argc, char **argv)
 		}
 		n = collect_dedup_entries(mounts, has_t, opt_t, has_x, opt_x, &entries);
 	} else {
-			/* Arguments were provided: collect one fs_entry_t for each path. */
+		/* Arguments were provided: collect one fs_entry_t for each path. */
 		char **arg;
 		int argc_n = 0;
 		for (arg = argv; *arg; arg++)
@@ -1109,7 +1145,7 @@ int my_fs_main(int argc, char **argv)
 				had_error = 1;
 				continue;
 			}
-				/* Match df behavior: first canonicalize the path with realpath,
+			/* Match df behavior: first canonicalize the path with realpath,
 				 * resolving relative paths, symlinks, and "..", then choose the
 				 * longest mountpoint prefix with boundary checks.
 				 * The boundary check prevents /foo from matching /foobar. The
@@ -1135,7 +1171,9 @@ int my_fs_main(int argc, char **argv)
 			if (best) {
 				if ((has_t && strcmp(best->fstype, opt_t) != 0) ||
 					(has_x && strcmp(best->fstype, opt_x) == 0)) {
-					free_fs_entry(&entries[n]); /* Free the already allocated path when filtered out. */
+					free_fs_entry(
+						&entries
+							[n]); /* Free the already allocated path when filtered out. */
 					continue;
 				}
 				entries[n].device = xstrdup(best->device);
