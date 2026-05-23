@@ -7,7 +7,7 @@
 #include <sys/sysinfo.h>
 
 /* 從 /proc/stat 讀取 CPU 總體時間標記 (CPU ticks) */
-unsigned long long get_cpu_usage_ticks(void)
+static unsigned long long get_cpu_usage_ticks(void)
 {
 	unsigned long long utime = 0, ntime = 0, stime = 0, itime = 0;
 	unsigned long long iowtime = 0, irq = 0, sirq = 0, steal = 0;
@@ -129,18 +129,17 @@ int diag_read_fragmentation(const char *path,
 
 	if (!collect_extents) {
 		/* count-only 路徑（-F 目錄掃描）：fm_extent_count=0 讓核心只回傳總數 */
-		fm = xzalloc(sizeof(*fm));
-		fm->fm_start = 0;
-		fm->fm_length = FIEMAP_MAX_OFFSET;
-		fm->fm_flags = 0;
-		fm->fm_extent_count = 0;
-		if (ioctl(fd, FS_IOC_FIEMAP, fm) != 0) {
-			free(fm);
+		struct fiemap fm_stack;
+		memset(&fm_stack, 0, sizeof(fm_stack));
+		fm_stack.fm_start = 0;
+		fm_stack.fm_length = FIEMAP_MAX_OFFSET;
+		fm_stack.fm_flags = 0;
+		fm_stack.fm_extent_count = 0;
+		if (ioctl(fd, FS_IOC_FIEMAP, &fm_stack) != 0) {
 			close(fd);
 			return -1;
 		}
-		f->extent_count = fm->fm_mapped_extents;
-		free(fm);
+		f->extent_count = fm_stack.fm_mapped_extents;
 		close(fd);
 		return 0;
 	}
@@ -235,24 +234,6 @@ void diag_get_sys_snap(diag_sys_snap_t *snap)
 }
 
 /* --- UI 終端模式切換 --- */
-
-/* 切換至 Raw 模式 (禁用緩衝與回顯)，用於即時監控介面 */
-void diag_ui_mode_raw(struct termios *old_t)
-{
-
-	set_termios_to_raw(STDIN_FILENO, old_t, 0);
-	printf(DIAG_HIDE DIAG_CLR_SCR);
-	fflush(stdout);
-}
-
-/* 恢復標準終端模式並顯示游標 */
-void diag_ui_mode_normal(struct termios *old_t)
-{
-
-	printf(DIAG_SHOW);
-	tcsetattr(STDIN_FILENO, TCSANOW, old_t);
-	fflush(stdout);
-}
 
 static struct termios g_tui_saved_termios;
 static volatile sig_atomic_t g_tui_active = 0;

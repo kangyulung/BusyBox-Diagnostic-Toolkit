@@ -159,7 +159,7 @@ static proc_node_t *fetch_proc_list(void)
 	procps_status_t *p = NULL;
 	int flags = PSSCAN_PID | PSSCAN_PPID | PSSCAN_COMM | PSSCAN_RSS |
 				PSSCAN_VSZ | PSSCAN_UTIME | PSSCAN_STIME | PSSCAN_STATE |
-				PSSCAN_NICE | PSSCAN_UIDGID | PSSCAN_TASKS;
+				PSSCAN_NICE | PSSCAN_UIDGID;
 
 	while ((p = procps_scan(p, flags)) != NULL) {
 		if (G.target_pid > 0 && p->pid != G.target_pid)
@@ -431,9 +431,6 @@ int my_proc_main(int argc, char **argv)
 	int iterations = -1;
 	int pid = -1;
 	int opts;
-
-	G.delay = 1.0;
-	G.sort_mode = 'P';
 
 	opts = getopt32(argv, "td:n:+p:+b", &delay_str, &iterations, &pid);
 

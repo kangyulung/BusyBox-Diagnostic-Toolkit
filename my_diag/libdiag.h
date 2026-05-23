@@ -65,7 +65,6 @@ typedef struct {
 } diag_sys_snap_t;
 
 /* 通用解析與格式化工具 */
-unsigned long long get_cpu_usage_ticks(void);
 char *
 diag_format_time(char *buf, unsigned long long utime, unsigned long long stime);
 
@@ -75,8 +74,6 @@ const char *diag_get_tcp_state(int state);
 void diag_get_sys_snap(diag_sys_snap_t *snap);
 
 /* 終端 UI 模式控制 */
-void diag_ui_mode_raw(struct termios *old); /* 開啟 Raw mode 以處理單鍵輸入 */
-void diag_ui_mode_normal(struct termios *old); /* 恢復標準終端模式 */
 void diag_tui_init(void);                /* 開啟 TUI (Raw mode、隱藏游標、註冊 cleanup) */
 void diag_tui_restore(void);             /* 關閉 TUI (恢復游標與終端模式) */
 int diag_ui_ask_int(const char *prompt); /* 彈出式詢問數值 (會自動暫停與恢復 TUI) */

@@ -93,7 +93,7 @@ static void commit_entry(void)
 	g_entries_cnt++;
 }
 
-/* 快速 IPv4 格式化：寫入 "a.b.c.d:port"，回傳長度 */
+/* 快速 IPv4 格式化：寫入 "a.b.c.d:port" */
 static void fast_format_ipv4(char *p, uint32_t addr, uint16_t port)
 {
 	unsigned char *b = (unsigned char *) &addr;
@@ -588,7 +588,7 @@ static void do_watch(void)
 				break;
 
 			/* 清屏並印表頭 */
-			printf(DIAG_CLEAR);
+			printf(DIAG_CLR_SCR);
 			printf(DIAG_CYAN "[MY_NET]" DIAG_RESET " Refresh: %ds"
 							 "  TCP:%s UDP:%s Listen-only:%s"
 							 "  Press Q to quit" DIAG_CLR_EOL "\n",
@@ -603,6 +603,8 @@ static void do_watch(void)
 		}
 
 		do_scan();
+		if (!G.batch_mode)
+			printf(DIAG_CLR_DOWN);
 
 		fflush(stdout);
 		diag_delay(G.interval * 1000, G.batch_mode);
