@@ -1,27 +1,27 @@
-# 基礎環境使用 Ubuntu 22.04
+# Use Ubuntu 22.04 as the base environment
 FROM ubuntu:22.04
 
-# 避免安裝過程中的互動式提問
+# Avoid interactive prompts during installation
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y \
-    # 1. 行程資源分析
+    # 1. Process resource analysis
     procps \
     htop \
     lsof \
     strace \
-    # 2. 檔案系統健康檢測
+    # 2. File system health check
     e2fsprogs \
     xfsprogs \
     util-linux \
     smartmontools \
-    # 3. 網路連線狀態監控
+    # 3. Network connection status monitoring
     net-tools \
     iproute2 \
     tcpdump \
     iputils-ping \
     netcat-openbsd \
-    # 基礎開發環境與換行修正
+    # Basic development environment and line ending fixes
     build-essential \
     libncurses5-dev \
     bison \
@@ -30,7 +30,7 @@ RUN apt-get update && apt-get install -y \
     clang-format \
     && rm -rf /var/lib/apt/lists/*
 
-# 移除 Ubuntu minimal 的 man stub 與 dpkg-divert，讓 man-db 裝真正的 binary
+# Remove Ubuntu minimal's man stub and dpkg-divert so man-db installs the real binary
 RUN dpkg-divert --remove /usr/bin/man && \
     rm -f /usr/bin/man /etc/dpkg/dpkg.cfg.d/excludes && \
     apt-get update && \
@@ -39,5 +39,5 @@ RUN dpkg-divert --remove /usr/bin/man && \
 
 WORKDIR /home/project/busybox
 
-# 預設啟動 Bash
+# Start Bash by default
 CMD ["/bin/bash"]
